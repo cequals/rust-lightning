@@ -590,9 +590,11 @@ mod tests {
 		msg_events: Mutex<Vec<MessageSendEvent>>,
 	}
 	impl RoutingMessageHandler for MsgHandler {
-		fn handle_node_announcement(&self, _msg: &NodeAnnouncement) -> Result<bool, LightningError> { Ok(false) }
-		fn handle_channel_announcement(&self, _msg: &ChannelAnnouncement) -> Result<bool, LightningError> { Ok(false) }
-		fn handle_channel_update(&self, _msg: &ChannelUpdate) -> Result<bool, LightningError> { Ok(false) }
+		fn handle_node_announcement(&self, _their_node_id: Option<&PublicKey>, _msg: &NodeAnnouncement) -> Result<bool, LightningError> { Ok(false) }
+		fn handle_channel_announcement(&self, _their_node_id: Option<&PublicKey>, _msg: &ChannelAnnouncement) -> Result<bool, LightningError> { Ok(false) }
+		fn handle_channel_update(
+			&self, _their_node_id: Option<&PublicKey>, _msg: &ChannelUpdate,
+		) -> Result<bool, LightningError> { Ok(false) }
 		fn get_next_channel_announcement(&self, _starting_point: u64) -> Option<(ChannelAnnouncement, Option<ChannelUpdate>, Option<ChannelUpdate>)> { None }
 		fn get_next_node_announcement(&self, _starting_point: Option<&NodeId>) -> Option<NodeAnnouncement> { None }
 		fn peer_connected(&self, _their_node_id: &PublicKey, _init_msg: &Init, _inbound: bool) -> Result<(), ()> { Ok(()) }

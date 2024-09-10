@@ -1467,7 +1467,7 @@ impl<L: Deref> NetworkGraph<L> where L::Target: Logger {
 		// redundant announcement.
 		if let Some(node) = self.nodes.read().unwrap().get(&msg.contents.node_id) {
 			if let Some(node_info) = node.announcement_info.as_ref() {
-				if node_info.last_update()  == msg.contents.timestamp {
+				if node_info.last_update  == msg.contents.timestamp {
 					return Err(LightningError{err: "Update had the same timestamp as last processed update".to_owned(), action: ErrorAction::IgnoreDuplicateGossip});
 				}
 			}

@@ -1095,6 +1095,10 @@ where
 					});
 				},
 			}
+		} else {
+			return Err(APIError::APIMisuseError {
+				err: format!("Unknown scid provided: {}", intercept_scid),
+			});
 		}
 
 		if let Some(counterparty_node_id) = should_persist {

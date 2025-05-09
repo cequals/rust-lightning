@@ -861,6 +861,10 @@ where
 					});
 				},
 			}
+		} else {
+			return Err(APIError::APIMisuseError {
+				err: format!("Unknown scid provided: {}", intercept_scid),
+			});
 		}
 
 		Ok(())

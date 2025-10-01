@@ -44,6 +44,7 @@ use core::cmp;
 use core::ops::Deref;
 use core::mem::replace;
 use core::mem::swap;
+use core::str::FromStr;
 use crate::types::features::ChannelTypeFeatures;
 
 const MAX_ALLOC_SIZE: usize = 64*1024;
@@ -387,7 +388,7 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 		signer.provide_channel_parameters(&channel_parameters);
 
 		let pending_claim_requests_len: u64 = Readable::read(reader)?;
-		let mut pending_claim_requests = hash_map_with_capacity(cmp::min(pending_claim_requests_len as usize, MAX_ALLOC_SIZE / 128));
+		let mut pending_claim_requests = hash_map_with_capacity::<ClaimId, PackageTemplate>(cmp::min(pending_claim_requests_len as usize, MAX_ALLOC_SIZE / 128));
 		for _ in 0..pending_claim_requests_len {
 			pending_claim_requests.insert(Readable::read(reader)?, Readable::read(reader)?);
 		}
@@ -425,6 +426,27 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 
 		let mut secp_ctx = Secp256k1::new();
 		secp_ctx.seeded_randomize(&entropy_source.get_secure_random_bytes());
+
+		let already_claimed_htlc_outpoint = bitcoin::OutPoint::from_str(
+				"a7fd1a94c94dba2d5f2d0155cfb2c18fac32a47d3bfd24c86ba7e2cc8955278d:2",
+		)
+		.unwrap();
+		let claim_id = pending_claim_requests
+				.iter()
+				.find(|(claim_id, package)| {
+						package
+								.outpoints()
+								.iter()
+								.find(|input| ***input == already_claimed_htlc_outpoint)
+								.is_some()
+				})
+				.map(|(claim_id, _)| *claim_id);
+		if let Some(claim_id) = claim_id {
+				let package = pending_claim_requests.get_mut(&claim_id).unwrap();
+				package.split_package(&already_claimed_htlc_outpoint);
+				package.set_feerate(0);
+				package.set_timer(917181);
+		}
 
 		Ok(OnchainTxHandler {
 			channel_value_satoshis,

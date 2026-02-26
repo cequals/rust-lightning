@@ -7013,6 +7013,7 @@ mod tests {
 		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
 		let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
 		let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+		nodes[1].disable_monitor_completeness_assertion();
 		let channel = create_announced_chan_between_nodes(&nodes, 0, 1);
 		create_announced_chan_between_nodes(&nodes, 1, 2);
 

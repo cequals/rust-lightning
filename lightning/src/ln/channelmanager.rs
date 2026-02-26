@@ -2837,12 +2837,12 @@ pub struct ChannelManager<
 	#[cfg(any(test, feature = "_test_utils"))]
 	pub(super) per_peer_state: FairRwLock<HashMap<PublicKey, Mutex<PeerState<SP>>>>,
 
-	/// We only support using one of [`ChannelMonitorUpdateStatus::InProgress`] and
-	/// [`ChannelMonitorUpdateStatus::Completed`] without restarting. Because the API does not
-	/// otherwise directly enforce this, we enforce it in non-test builds here by storing which one
-	/// is in use.
-	#[cfg(not(any(test, feature = "_externalize_tests")))]
-	monitor_update_type: AtomicUsize,
+	/// When set, disables the panic when `Watch::update_channel` returns `Completed` while
+	/// prior updates are still `InProgress`. Some legacy tests switch the persister between
+	/// `InProgress` and `Completed` mid-flight, which violates this contract but is otherwise
+	/// harmless in a test context.
+	#[cfg(test)]
+	pub(crate) skip_monitor_update_assertion: AtomicBool,
 
 	/// The set of events which we need to give to the user to handle. In some cases an event may
 	/// require some further action after the user handles it (currently only blocking a monitor
@@ -3710,19 +3710,11 @@ macro_rules! handle_new_monitor_update {
 				panic!("{}", err_str);
 			},
 			ChannelMonitorUpdateStatus::InProgress => {
-				#[cfg(not(any(test, feature = "_externalize_tests")))]
-				if $self.monitor_update_type.swap(1, Ordering::Relaxed) == 2 {
-					panic!("Cannot use both ChannelMonitorUpdateStatus modes InProgress and Completed without restart");
-				}
 				log_debug!($logger, "ChannelMonitor update for {} in flight, holding messages until the update completes.",
 					$channel_id);
 				false
 			},
 			ChannelMonitorUpdateStatus::Completed => {
-				#[cfg(not(any(test, feature = "_externalize_tests")))]
-				if $self.monitor_update_type.swap(2, Ordering::Relaxed) == 1 {
-					panic!("Cannot use both ChannelMonitorUpdateStatus modes InProgress and Completed without restart");
-				}
 				$completed;
 				true
 			},
@@ -3750,6 +3742,15 @@ macro_rules! handle_new_monitor_update {
 			});
 		if $self.background_events_processed_since_startup.load(Ordering::Acquire) {
 			let update_res = $self.chain_monitor.update_channel($chan_id, &$in_flight_updates[$update_idx]);
+			// A Watch implementation must not return Completed while prior updates are
+			// still InProgress, as this would violate the async persistence contract.
+			#[cfg(test)]
+			let skip_check = $self.skip_monitor_update_assertion.load(Ordering::Relaxed);
+			#[cfg(not(test))]
+			let skip_check = false;
+			if !skip_check && update_res == ChannelMonitorUpdateStatus::Completed && $in_flight_updates.len() > 1 {
+				panic!("Watch::update_channel returned Completed while prior updates are still InProgress");
+			}
 			handle_new_monitor_update!($self, update_res, $logger, $chan_id, _internal, $completed)
 		} else {
 			// We blindly assume that the ChannelMonitorUpdate will be regenerated on startup if we
@@ -4007,8 +4008,8 @@ where
 
 			per_peer_state: FairRwLock::new(new_hash_map()),
 
-			#[cfg(not(any(test, feature = "_externalize_tests")))]
-			monitor_update_type: AtomicUsize::new(0),
+			#[cfg(test)]
+			skip_monitor_update_assertion: AtomicBool::new(false),
 
 			pending_events: Mutex::new(VecDeque::new()),
 			pending_events_processor: AtomicBool::new(false),
@@ -18191,8 +18192,8 @@ where
 
 			per_peer_state: FairRwLock::new(per_peer_state),
 
-			#[cfg(not(any(test, feature = "_externalize_tests")))]
-			monitor_update_type: AtomicUsize::new(0),
+			#[cfg(test)]
+			skip_monitor_update_assertion: AtomicBool::new(false),
 
 			pending_events: Mutex::new(pending_events_read),
 			pending_events_processor: AtomicBool::new(false),

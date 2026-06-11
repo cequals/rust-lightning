@@ -1559,6 +1559,7 @@ where
 
 		let result = if is_forward {
 			self.enqueue_forwarded_onion_message(
+				None,
 				NextMessageHop::NodeId(first_node_id),
 				onion_message,
 				log_suffix,
@@ -1674,7 +1675,8 @@ where
 	}
 
 	fn enqueue_forwarded_onion_message(
-		&self, next_hop: NextMessageHop, onion_message: OnionMessage, log_suffix: fmt::Arguments,
+		&self, prev_hop: Option<PublicKey>, next_hop: NextMessageHop, onion_message: OnionMessage,
+		log_suffix: fmt::Arguments,
 	) -> Result<(), SendError> {
 		let next_node_id = match next_hop {
 			NextMessageHop::NodeId(pubkey) => pubkey,
@@ -1689,6 +1691,7 @@ where
 							log_suffix
 						);
 						self.enqueue_intercepted_event(Event::OnionMessageIntercepted {
+							prev_hop,
 							next_hop,
 							message: onion_message,
 						});
@@ -1737,6 +1740,7 @@ where
 					log_suffix
 				);
 				self.enqueue_intercepted_event(Event::OnionMessageIntercepted {
+					prev_hop,
 					// Report the resolved node id rather than `next_hop`, which may be a
 					// `ShortChannelId` that we resolved to a known-but-offline peer. The
 					// `ShortChannelId` variant is reserved for the unknown-SCID interception path.
@@ -2351,6 +2355,7 @@ where
 			},
 			Ok(PeeledOnion::Forward(next_hop, onion_message)) => {
 				let _ = self.enqueue_forwarded_onion_message(
+					Some(peer_node_id),
 					next_hop,
 					onion_message,
 					format_args!("when forwarding peeled onion message from {}", peer_node_id),

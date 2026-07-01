@@ -1271,7 +1271,6 @@ fn intercept_unknown_scid_oms() {
 		nodes[2].node_id,
 		nodes[2].messenger.node_signer.get_receive_auth_key(),
 		MessageContext::Custom(Vec::new()),
-		false,
 		&*nodes[2].entropy_source,
 		&Secp256k1::new(),
 	);
@@ -1334,7 +1333,6 @@ fn intercept_resolved_scid_offline_peer_oms() {
 		nodes[2].node_id,
 		nodes[2].messenger.node_signer.get_receive_auth_key(),
 		MessageContext::Custom(Vec::new()),
-		false,
 		&*nodes[2].entropy_source,
 		&Secp256k1::new(),
 	);

@@ -258,7 +258,7 @@ pub enum NextMessageHop {
 	ShortChannelId(u64),
 }
 
-impl_ser_tlv_based_enum!(NextMessageHop,
+impl_writeable_tlv_based_enum!(NextMessageHop,
 	{0, NodeId} => (),
 	{2, ShortChannelId} => (),
 );

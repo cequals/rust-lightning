@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 #[cfg(feature = "tokio")]
 use core::future::Future;
@@ -45,9 +45,221 @@ struct FilesystemStoreInner {
 	data_dir: PathBuf,
 	tmp_file_counter: AtomicUsize,
 
-	// Per path lock that ensures that we don't have concurrent writes to the same file. The lock also encapsulates the
-	// latest written version per key.
-	locks: Mutex<HashMap<PathBuf, Arc<RwLock<u64>>>>,
+	// Per-path lock ensuring that writes and removes to the same file don't execute concurrently.
+	// The lock also encapsulates the latest operation state and outstanding durability work.
+	locks: Mutex<HashMap<PathBuf, Arc<RwLock<FilesystemStoreOperationState>>>>,
+}
+
+#[derive(Default)]
+struct FilesystemStoreOperationState {
+	latest_operation: Option<FilesystemStoreOperationAttempt>,
+	latest_applied_version: Option<u64>,
+	#[cfg(not(target_os = "windows"))]
+	pending_directory_sync_version: Option<u64>,
+	#[cfg(target_os = "windows")]
+	pending_file_sync: Option<PendingWindowsFileSync>,
+}
+
+impl FilesystemStoreOperationState {
+	fn has_pending_durability_work(&self) -> bool {
+		#[cfg(not(target_os = "windows"))]
+		{
+			self.pending_directory_sync_version.is_some()
+		}
+		#[cfg(target_os = "windows")]
+		{
+			self.pending_file_sync.is_some()
+		}
+	}
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+struct PendingWindowsFileSync {
+	version: u64,
+	path: PathBuf,
+	remove_after_sync: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilesystemStoreOperationAttemptStatus {
+	Started,
+	Applied,
+	Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FilesystemStoreOperationAttempt {
+	version: u64,
+	status: FilesystemStoreOperationAttemptStatus,
+}
+
+/// The outcome of executing a prepared filesystem store operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilesystemStoreOperationStatus {
+	/// The operation was applied to the filesystem.
+	Applied,
+	/// A newer operation for the same key was successfully applied, so this operation was skipped.
+	Superseded,
+}
+
+struct PreparedFilesystemStoreOperation {
+	inner: Arc<FilesystemStoreInner>,
+	dest_file_path: PathBuf,
+	inner_lock_ref: Option<Arc<RwLock<FilesystemStoreOperationState>>>,
+	version: u64,
+}
+
+impl PreparedFilesystemStoreOperation {
+	fn execute<
+		F: FnOnce(
+			&FilesystemStoreInner,
+			&Path,
+			&mut FilesystemStoreOperationState,
+			u64,
+		) -> Result<(), lightning::io::Error>,
+	>(
+		&mut self, callback: F,
+	) -> Result<FilesystemStoreOperationStatus, lightning::io::Error> {
+		let inner_lock_ref = self.inner_lock_ref.as_ref().expect("operation lock missing");
+		let mut state = inner_lock_ref.write().unwrap();
+
+		// If a previous operation changed the filesystem but failed to make that change durable,
+		// finish its durability work first. This either proves that the previous operation was
+		// applied or returns an I/O error; it never lets an older operation overwrite a possibly
+		// applied newer mutation.
+		self.inner.complete_pending_durability(&self.dest_file_path, &mut state)?;
+
+		if let Some(latest_applied_version) = state.latest_applied_version {
+			if self.version < latest_applied_version {
+				return Ok(FilesystemStoreOperationStatus::Superseded);
+			}
+			if self.version == latest_applied_version {
+				return Ok(FilesystemStoreOperationStatus::Applied);
+			}
+		}
+		if let Some(latest_operation) = state.latest_operation {
+			if self.version < latest_operation.version {
+				match latest_operation.status {
+					FilesystemStoreOperationAttemptStatus::Applied => {
+						return Ok(FilesystemStoreOperationStatus::Superseded);
+					},
+					FilesystemStoreOperationAttemptStatus::Started => {
+						// This is defensive: the per-key write lock normally prevents observing a
+						// concurrently executing operation. Never expose it as a successful outcome.
+						return Err(lightning::io::Error::new(
+							lightning::io::ErrorKind::WouldBlock,
+							"Filesystem store operation is blocked by a newer operation",
+						));
+					},
+					FilesystemStoreOperationAttemptStatus::Failed => {
+						// A failure without pending durability work happened before the filesystem
+						// mutation. It is safe for this older operation to apply. The newer token
+						// retains its reserved version and may still retry afterwards.
+					},
+				}
+			}
+			if self.version == latest_operation.version
+				&& latest_operation.status == FilesystemStoreOperationAttemptStatus::Applied
+			{
+				return Ok(FilesystemStoreOperationStatus::Applied);
+			}
+		}
+
+		// Claim the version before any I/O. Preparation reserves the version, but execution is what
+		// establishes the ordering barrier. A failed operation can retry its same version. A
+		// post-mutation failure leaves versioned durability work which is completed before any token
+		// may proceed. A pre-mutation failure leaves no such work, so an older operation may safely
+		// apply while the newer token retains its reserved version for a later retry.
+		let is_latest_operation =
+			state.latest_operation.map_or(true, |operation| self.version >= operation.version);
+		if is_latest_operation {
+			state.latest_operation = Some(FilesystemStoreOperationAttempt {
+				version: self.version,
+				status: FilesystemStoreOperationAttemptStatus::Started,
+			});
+		}
+		let result = callback(&self.inner, &self.dest_file_path, &mut state, self.version);
+		if result.is_ok() {
+			state.latest_applied_version = Some(
+				state
+					.latest_applied_version
+					.map_or(self.version, |version| version.max(self.version)),
+			);
+		}
+		if is_latest_operation {
+			state.latest_operation.as_mut().unwrap().status = if result.is_ok() {
+				FilesystemStoreOperationAttemptStatus::Applied
+			} else {
+				FilesystemStoreOperationAttemptStatus::Failed
+			};
+		}
+		result.map(|_| FilesystemStoreOperationStatus::Applied)
+	}
+}
+
+impl Drop for PreparedFilesystemStoreOperation {
+	fn drop(&mut self) {
+		if let Some(inner_lock_ref) = self.inner_lock_ref.take() {
+			self.inner.clean_lock(inner_lock_ref, &self.dest_file_path);
+		}
+	}
+}
+
+/// A prepared filesystem write that reserves its version when it is created.
+///
+/// The reserved version becomes the highest-started ordering barrier only when [`Self::execute`]
+/// is first called. Calling it again after an I/O error retries the same version. Pending
+/// durability work from any newer filesystem mutation is completed first. A newer applied or
+/// recovered version supersedes this one without changing the file. If a newer attempt failed
+/// before mutating the filesystem, this older write is instead executed because it is still safe
+/// to apply.
+pub struct FilesystemStoreWriteOperation {
+	operation: PreparedFilesystemStoreOperation,
+	buf: Vec<u8>,
+}
+
+impl FilesystemStoreWriteOperation {
+	/// Executes this prepared write once.
+	pub fn execute(&mut self) -> Result<FilesystemStoreOperationStatus, lightning::io::Error> {
+		self.operation.execute(|inner, dest_file_path, state, version| {
+			inner.write(dest_file_path, &self.buf, state, version)
+		})
+	}
+}
+
+/// A prepared filesystem remove that reserves its version when it is created.
+///
+/// The reserved version becomes the highest-started ordering barrier only when [`Self::execute`]
+/// is first called. Calling it again after an I/O error retries the same version and the same lazy
+/// or durable removal mode selected at preparation. Pending durability work from any newer
+/// filesystem mutation is completed first. A newer applied or recovered version supersedes this
+/// one without changing the file. If a newer attempt failed before mutating the filesystem, this
+/// older remove is instead executed because it is still safe to apply.
+pub struct FilesystemStoreRemoveOperation {
+	operation: PreparedFilesystemStoreOperation,
+	lazy: bool,
+}
+
+impl FilesystemStoreRemoveOperation {
+	/// Executes this prepared remove once.
+	///
+	/// A durable operation repeats outstanding durability work on retry even if an earlier attempt
+	/// already removed the destination file.
+	pub fn execute(&mut self) -> Result<FilesystemStoreOperationStatus, lightning::io::Error> {
+		let lazy = self.lazy;
+		self.operation.execute(|inner, dest_file_path, state, version| {
+			inner.remove(dest_file_path, lazy, state, version)
+		})
+	}
+}
+
+struct CleanupFile(PathBuf);
+
+impl Drop for CleanupFile {
+	fn drop(&mut self) {
+		fs::remove_file(&self.0).ok();
+	}
 }
 
 /// A [`KVStore`] and [`KVStoreSync`] implementation that writes to and reads from the file system.
@@ -77,17 +289,67 @@ impl FilesystemStore {
 		self.inner.data_dir.clone()
 	}
 
-	fn get_new_version_and_lock_ref(&self, dest_file_path: PathBuf) -> (Arc<RwLock<u64>>, u64) {
-		let version = self.next_version.fetch_add(1, Ordering::Relaxed);
-		if version == u64::MAX {
-			panic!("FilesystemStore version counter overflowed");
+	fn prepare_operation(&self, dest_file_path: PathBuf) -> PreparedFilesystemStoreOperation {
+		// Get a reference to the per-path state before allocating a version. This prevents another
+		// operation from completing and removing the state between those two steps.
+		let inner_lock_ref = self.inner.get_inner_lock_ref(dest_file_path.clone());
+		let version =
+			match self.next_version.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |version| {
+				version.checked_add(1)
+			}) {
+				Ok(version) => version,
+				Err(_) => {
+					self.inner.clean_lock(inner_lock_ref, &dest_file_path);
+					panic!("FilesystemStore version counter overflowed");
+				},
+			};
+
+		PreparedFilesystemStoreOperation {
+			inner: Arc::clone(&self.inner),
+			dest_file_path,
+			inner_lock_ref: Some(inner_lock_ref),
+			version,
 		}
+	}
 
-		// Get a reference to the inner lock. We do this early so that the arc can double as an in-flight counter for
-		// cleaning up unused locks.
-		let inner_lock_ref = self.inner.get_inner_lock_ref(dest_file_path);
+	/// Prepares a write, reserving its version before returning.
+	///
+	/// The returned operation can be executed repeatedly to retry transient I/O errors without
+	/// allocating a new version. The version becomes the highest-started ordering barrier on the
+	/// first call to [`FilesystemStoreWriteOperation::execute`]. The operation must be prepared when
+	/// the logical write is issued, rather than when an asynchronous executor first polls it.
+	pub fn prepare_write(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
+	) -> Result<FilesystemStoreWriteOperation, lightning::io::Error> {
+		let dest_file_path = self.inner.get_checked_dest_file_path(
+			primary_namespace,
+			secondary_namespace,
+			Some(key),
+			"write",
+		)?;
+		Ok(FilesystemStoreWriteOperation { operation: self.prepare_operation(dest_file_path), buf })
+	}
 
-		(inner_lock_ref, version)
+	/// Prepares a remove, reserving its version and removal mode before returning.
+	///
+	/// The returned operation can be executed repeatedly to retry transient I/O errors without
+	/// allocating a new version or changing the lazy/durable mode. The version becomes the
+	/// highest-started ordering barrier on the first call to
+	/// [`FilesystemStoreRemoveOperation::execute`]. The operation must be prepared when the logical
+	/// remove is issued, rather than when an asynchronous executor first polls it.
+	pub fn prepare_remove(
+		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
+	) -> Result<FilesystemStoreRemoveOperation, lightning::io::Error> {
+		let dest_file_path = self.inner.get_checked_dest_file_path(
+			primary_namespace,
+			secondary_namespace,
+			Some(key),
+			"remove",
+		)?;
+		Ok(FilesystemStoreRemoveOperation {
+			operation: self.prepare_operation(dest_file_path),
+			lazy,
+		})
 	}
 
 	#[cfg(any(all(feature = "tokio", test), fuzzing))]
@@ -114,27 +376,15 @@ impl KVStoreSync for FilesystemStore {
 	fn write(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
 	) -> Result<(), lightning::io::Error> {
-		let path = self.inner.get_checked_dest_file_path(
-			primary_namespace,
-			secondary_namespace,
-			Some(key),
-			"write",
-		)?;
-		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(path.clone());
-		self.inner.write_version(inner_lock_ref, path, buf, version)
+		self.prepare_write(primary_namespace, secondary_namespace, key, buf)
+			.and_then(|mut operation| operation.execute().map(|_| ()))
 	}
 
 	fn remove(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
 	) -> Result<(), lightning::io::Error> {
-		let path = self.inner.get_checked_dest_file_path(
-			primary_namespace,
-			secondary_namespace,
-			Some(key),
-			"remove",
-		)?;
-		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(path.clone());
-		self.inner.remove_version(inner_lock_ref, path, lazy, version)
+		self.prepare_remove(primary_namespace, secondary_namespace, key, lazy)
+			.and_then(|mut operation| operation.execute().map(|_| ()))
 	}
 
 	fn list(
@@ -151,9 +401,9 @@ impl KVStoreSync for FilesystemStore {
 }
 
 impl FilesystemStoreInner {
-	fn get_inner_lock_ref(&self, path: PathBuf) -> Arc<RwLock<u64>> {
+	fn get_inner_lock_ref(&self, path: PathBuf) -> Arc<RwLock<FilesystemStoreOperationState>> {
 		let mut outer_lock = self.locks.lock().unwrap();
-		Arc::clone(&outer_lock.entry(path).or_default())
+		Arc::clone(outer_lock.entry(path).or_default())
 	}
 
 	fn get_dest_dir_path(
@@ -206,31 +456,6 @@ impl FilesystemStoreInner {
 		Ok(buf)
 	}
 
-	fn execute_locked_write<F: FnOnce() -> Result<(), lightning::io::Error>>(
-		&self, inner_lock_ref: Arc<RwLock<u64>>, dest_file_path: PathBuf, version: u64, callback: F,
-	) -> Result<(), lightning::io::Error> {
-		let res = {
-			let mut last_written_version = inner_lock_ref.write().unwrap();
-
-			// Check if we already have a newer version written/removed. This is used in async contexts to realize eventual
-			// consistency.
-			let is_stale_version = version <= *last_written_version;
-
-			// If the version is not stale, we execute the callback. Otherwise we can and must skip writing.
-			if is_stale_version {
-				Ok(())
-			} else {
-				callback().map(|_| {
-					*last_written_version = version;
-				})
-			}
-		};
-
-		self.clean_locks(&inner_lock_ref, dest_file_path);
-
-		res
-	}
-
 	fn execute_locked_read<F: FnOnce() -> Result<(), lightning::io::Error>>(
 		&self, dest_file_path: PathBuf, callback: F,
 	) -> Result<(), lightning::io::Error> {
@@ -239,29 +464,76 @@ impl FilesystemStoreInner {
 			let _guard = inner_lock_ref.read().unwrap();
 			callback()
 		};
-		self.clean_locks(&inner_lock_ref, dest_file_path);
+		self.clean_lock(inner_lock_ref, &dest_file_path);
 		res
 	}
 
-	fn clean_locks(&self, inner_lock_ref: &Arc<RwLock<u64>>, dest_file_path: PathBuf) {
-		// If there no arcs in use elsewhere, this means that there are no in-flight writes. We can remove the map entry
-		// to prevent leaking memory. The two arcs that are expected are the one in the map and the one held here in
-		// inner_lock_ref. The outer lock is obtained first, to avoid a new arc being cloned after we've already
-		// counted.
+	fn clean_lock(
+		&self, inner_lock_ref: Arc<RwLock<FilesystemStoreOperationState>>, dest_file_path: &Path,
+	) {
+		let inner_lock_weak = Arc::downgrade(&inner_lock_ref);
+		// Drop this caller's reference before counting. Otherwise two concurrent cleanups can both
+		// observe the other's about-to-be-dropped reference and leave the map entry behind.
+		drop(inner_lock_ref);
 		let mut outer_lock = self.locks.lock().unwrap();
-
-		let strong_count = Arc::strong_count(&inner_lock_ref);
-		debug_assert!(strong_count >= 2, "Unexpected FilesystemStore strong count");
-
-		if strong_count == 2 {
-			outer_lock.remove(&dest_file_path);
+		let should_remove = match outer_lock.get(dest_file_path) {
+			Some(state) => {
+				Weak::ptr_eq(&inner_lock_weak, &Arc::downgrade(state))
+					&& Arc::strong_count(state) == 1
+					&& !state.read().unwrap().has_pending_durability_work()
+			},
+			None => false,
+		};
+		if should_remove {
+			outer_lock.remove(dest_file_path);
 		}
 	}
 
-	/// Writes a specific version of a key to the filesystem. If a newer version has been written already, this function
-	/// returns early without writing.
-	fn write_version(
-		&self, inner_lock_ref: Arc<RwLock<u64>>, dest_file_path: PathBuf, buf: Vec<u8>,
+	fn mark_version_applied(state: &mut FilesystemStoreOperationState, version: u64) {
+		state.latest_applied_version =
+			Some(state.latest_applied_version.map_or(version, |applied| applied.max(version)));
+		if let Some(latest_operation) = state.latest_operation.as_mut() {
+			if latest_operation.version == version {
+				latest_operation.status = FilesystemStoreOperationAttemptStatus::Applied;
+			}
+		}
+	}
+
+	fn complete_pending_durability(
+		&self, dest_file_path: &Path, state: &mut FilesystemStoreOperationState,
+	) -> lightning::io::Result<()> {
+		#[cfg(not(target_os = "windows"))]
+		if let Some(version) = state.pending_directory_sync_version {
+			let parent_directory = dest_file_path.parent().ok_or_else(|| {
+				let msg =
+					format!("Could not retrieve parent directory of {}.", dest_file_path.display());
+				std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
+			})?;
+			let dir_file = fs::OpenOptions::new().read(true).open(parent_directory)?;
+			dir_file.sync_all()?;
+			state.pending_directory_sync_version = None;
+			Self::mark_version_applied(state, version);
+		}
+
+		#[cfg(target_os = "windows")]
+		if let Some(pending_file_sync) = state.pending_file_sync.clone() {
+			let file =
+				fs::OpenOptions::new().read(true).write(true).open(&pending_file_sync.path)?;
+			file.sync_all()?;
+			if pending_file_sync.remove_after_sync {
+				// The logical removal is already durable at this point. A leftover trash file is
+				// harmless and will also be cleaned during listing.
+				fs::remove_file(&pending_file_sync.path).ok();
+			}
+			state.pending_file_sync = None;
+			Self::mark_version_applied(state, pending_file_sync.version);
+		}
+
+		Ok(())
+	}
+
+	fn write(
+		&self, dest_file_path: &Path, buf: &[u8], state: &mut FilesystemStoreOperationState,
 		version: u64,
 	) -> lightning::io::Result<()> {
 		let parent_directory = dest_file_path.parent().ok_or_else(|| {
@@ -269,150 +541,132 @@ impl FilesystemStoreInner {
 				format!("Could not retrieve parent directory of {}.", dest_file_path.display());
 			std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
 		})?;
-		fs::create_dir_all(&parent_directory)?;
+		fs::create_dir_all(parent_directory)?;
 
 		// Do a crazy dance with lots of fsync()s to be overly cautious here...
 		// We never want to end up in a state where we've lost the old data, or end up using the
 		// old data on power loss after we've returned.
 		// The way to atomically write a file on Unix platforms is:
 		// open(tmpname), write(tmpfile), fsync(tmpfile), close(tmpfile), rename(), fsync(dir)
-		let mut tmp_file_path = dest_file_path.clone();
+		let mut tmp_file_path = dest_file_path.to_path_buf();
 		let tmp_file_ext = format!("{}.tmp", self.tmp_file_counter.fetch_add(1, Ordering::AcqRel));
 		tmp_file_path.set_extension(tmp_file_ext);
+		let _cleanup_file = CleanupFile(tmp_file_path.clone());
 
 		{
 			let mut tmp_file = fs::File::create(&tmp_file_path)?;
-			tmp_file.write_all(&buf)?;
+			tmp_file.write_all(buf)?;
 			tmp_file.sync_all()?;
 		}
 
-		self.execute_locked_write(inner_lock_ref, dest_file_path.clone(), version, || {
-			#[cfg(not(target_os = "windows"))]
-			{
-				fs::rename(&tmp_file_path, &dest_file_path)?;
-				let dir_file = fs::OpenOptions::new().read(true).open(&parent_directory)?;
-				dir_file.sync_all()?;
-				Ok(())
-			}
+		#[cfg(not(target_os = "windows"))]
+		{
+			fs::rename(&tmp_file_path, dest_file_path)?;
+			state.pending_directory_sync_version = Some(version);
+			self.complete_pending_durability(dest_file_path, state)
+		}
 
-			#[cfg(target_os = "windows")]
-			{
-				let res = if dest_file_path.exists() {
-					call!(unsafe {
-						windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
-							path_to_windows_str(&dest_file_path).as_ptr(),
-							path_to_windows_str(&tmp_file_path).as_ptr(),
-							std::ptr::null(),
-							windows_sys::Win32::Storage::FileSystem::REPLACEFILE_IGNORE_MERGE_ERRORS,
-							std::ptr::null_mut() as *const core::ffi::c_void,
-							std::ptr::null_mut() as *const core::ffi::c_void,
-							)
-					})
-				} else {
-					call!(unsafe {
-						windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-							path_to_windows_str(&tmp_file_path).as_ptr(),
-							path_to_windows_str(&dest_file_path).as_ptr(),
-							windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH
+		#[cfg(target_os = "windows")]
+		{
+			let res = if dest_file_path.exists() {
+				call!(unsafe {
+					windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
+						path_to_windows_str(&dest_file_path).as_ptr(),
+						path_to_windows_str(&tmp_file_path).as_ptr(),
+						std::ptr::null(),
+						windows_sys::Win32::Storage::FileSystem::REPLACEFILE_IGNORE_MERGE_ERRORS,
+						std::ptr::null_mut() as *const core::ffi::c_void,
+						std::ptr::null_mut() as *const core::ffi::c_void,
+					)
+				})
+			} else {
+				call!(unsafe {
+					windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+						path_to_windows_str(&tmp_file_path).as_ptr(),
+						path_to_windows_str(&dest_file_path).as_ptr(),
+						windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH
 							| windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING,
-							)
-					})
-				};
+					)
+				})
+			};
 
-				match res {
-					Ok(()) => {
-						// We fsync the dest file in hopes this will also flush the metadata to disk.
-						let dest_file =
-							fs::OpenOptions::new().read(true).write(true).open(&dest_file_path)?;
-						dest_file.sync_all()?;
-						Ok(())
-					},
-					Err(e) => Err(e.into()),
-				}
+			match res {
+				Ok(()) => {
+					// We fsync the destination in hopes this will also flush its metadata to disk.
+					// Record this stage before opening the file so a failed attempt cannot be
+					// mistaken for an applied write merely because the temp path was moved.
+					state.pending_file_sync = Some(PendingWindowsFileSync {
+						version,
+						path: dest_file_path.to_path_buf(),
+						remove_after_sync: false,
+					});
+					self.complete_pending_durability(dest_file_path, state)
+				},
+				Err(e) => Err(e.into()),
 			}
-		})
+		}
 	}
 
-	fn remove_version(
-		&self, inner_lock_ref: Arc<RwLock<u64>>, dest_file_path: PathBuf, lazy: bool, version: u64,
+	fn remove(
+		&self, dest_file_path: &Path, lazy: bool, state: &mut FilesystemStoreOperationState,
+		version: u64,
 	) -> lightning::io::Result<()> {
-		self.execute_locked_write(inner_lock_ref, dest_file_path.clone(), version, || {
-			if !dest_file_path.is_file() {
-				return Ok(());
+		if lazy {
+			if dest_file_path.is_file() {
+				fs::remove_file(dest_file_path)?;
 			}
+			return Ok(());
+		}
 
-			if lazy {
-				// If we're lazy we just call remove and be done with it.
-				fs::remove_file(&dest_file_path)?;
-			} else {
-				// If we're not lazy we try our best to persist the updated metadata to ensure
-				// atomicity of this call.
-				#[cfg(not(target_os = "windows"))]
-				{
-					fs::remove_file(&dest_file_path)?;
+		#[cfg(not(target_os = "windows"))]
+		{
+			if dest_file_path.is_file() {
+				fs::remove_file(dest_file_path)?;
+				state.pending_directory_sync_version = Some(version);
+			}
+			// `remove_file` corresponds to POSIX `unlink`, whose changes might get cached and
+			// lost on crash. Persist it by syncing the parent directory. If the sync fails, the
+			// versioned pending action remains for this or any other token to retry.
+			self.complete_pending_durability(dest_file_path, state)?;
+		}
 
-					let parent_directory = dest_file_path.parent().ok_or_else(|| {
-						let msg = format!(
-							"Could not retrieve parent directory of {}.",
-							dest_file_path.display()
-						);
-						std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
-					})?;
-					let dir_file = fs::OpenOptions::new().read(true).open(parent_directory)?;
-					// The above call to `fs::remove_file` corresponds to POSIX `unlink`, whose changes
-					// to the inode might get cached (and hence possibly lost on crash), depending on
-					// the target platform and file system.
-					//
-					// In order to assert we permanently removed the file in question we therefore
-					// call `fsync` on the parent directory on platforms that support it.
-					dir_file.sync_all()?;
-				}
+		#[cfg(target_os = "windows")]
+		{
+			if dest_file_path.is_file() {
+				// Since Windows `DeleteFile` API is not persisted until the last open file handle
+				// is dropped, and there seemingly is no reliable way to flush the directory
+				// metadata, we here fall back to use a 'recycling bin' model, i.e., first move the
+				// file to be deleted to a temporary trash file and remove the latter file
+				// afterwards.
+				//
+				// This should be marginally better, as, according to the documentation,
+				// `MoveFileExW` APIs should offer stronger persistence guarantees,
+				// at least if `MOVEFILE_WRITE_THROUGH`/`MOVEFILE_REPLACE_EXISTING` is set.
+				// However, all this is partially based on assumptions and local experiments, as
+				// Windows API is horribly underdocumented.
+				let mut trash_file_path = dest_file_path.to_path_buf();
+				let trash_file_ext =
+					format!("{}.trash", self.tmp_file_counter.fetch_add(1, Ordering::AcqRel));
+				trash_file_path.set_extension(trash_file_ext);
 
-				#[cfg(target_os = "windows")]
-				{
-					// Since Windows `DeleteFile` API is not persisted until the last open file handle
-					// is dropped, and there seemingly is no reliable way to flush the directory
-					// metadata, we here fall back to use a 'recycling bin' model, i.e., first move the
-					// file to be deleted to a temporary trash file and remove the latter file
-					// afterwards.
-					//
-					// This should be marginally better, as, according to the documentation,
-					// `MoveFileExW` APIs should offer stronger persistence guarantees,
-					// at least if `MOVEFILE_WRITE_THROUGH`/`MOVEFILE_REPLACE_EXISTING` is set.
-					// However, all this is partially based on assumptions and local experiments, as
-					// Windows API is horribly underdocumented.
-					let mut trash_file_path = dest_file_path.clone();
-					let trash_file_ext =
-						format!("{}.trash", self.tmp_file_counter.fetch_add(1, Ordering::AcqRel));
-					trash_file_path.set_extension(trash_file_ext);
-
-					call!(unsafe {
-						windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-							path_to_windows_str(&dest_file_path).as_ptr(),
-							path_to_windows_str(&trash_file_path).as_ptr(),
-							windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH
+				call!(unsafe {
+					windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+						path_to_windows_str(&dest_file_path).as_ptr(),
+						path_to_windows_str(&trash_file_path).as_ptr(),
+						windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH
 							| windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING,
-							)
-					})?;
-
-					{
-						// We fsync the trash file in hopes this will also flush the original's file
-						// metadata to disk.
-						let trash_file = fs::OpenOptions::new()
-							.read(true)
-							.write(true)
-							.open(&trash_file_path.clone())?;
-						trash_file.sync_all()?;
-					}
-
-					// We're fine if this remove would fail as the trash file will be cleaned up in
-					// list eventually.
-					fs::remove_file(trash_file_path).ok();
-				}
+					)
+				})?;
+				state.pending_file_sync = Some(PendingWindowsFileSync {
+					version,
+					path: trash_file_path,
+					remove_after_sync: true,
+				});
+				self.complete_pending_durability(dest_file_path, state)?;
 			}
+		}
 
-			Ok(())
-		})
+		Ok(())
 	}
 
 	fn list(&self, prefixed_dest: PathBuf) -> lightning::io::Result<Vec<String>> {
@@ -428,6 +682,9 @@ impl FilesystemStoreInner {
 			'skip_entry: for entry in fs::read_dir(&prefixed_dest)? {
 				let entry = entry?;
 				let p = entry.path();
+				if self.dir_entry_is_store_artifact(&p) {
+					continue 'skip_entry;
+				}
 
 				let res = dir_entry_is_key(&entry);
 				match res {
@@ -458,6 +715,35 @@ impl FilesystemStoreInner {
 
 		Ok(keys)
 	}
+
+	fn dir_entry_is_store_artifact(&self, path: &Path) -> bool {
+		match path.extension().and_then(|ext| ext.to_str()) {
+			Some("tmp") => true,
+			Some("trash") => {
+				#[cfg(target_os = "windows")]
+				{
+					// A remove operation holds its per-key write lock across MoveFileEx and
+					// registering the trash path. Taking every state read lock while holding the
+					// lock-map mutex closes the window where listing could otherwise delete the
+					// live trash file before it is synced. Lock cleanup uses the same order.
+					let outer_lock = self.locks.lock().unwrap();
+					let is_pending = outer_lock.values().any(|state| {
+						state
+							.read()
+							.unwrap()
+							.pending_file_sync
+							.as_ref()
+							.map_or(false, |pending| pending.path == path)
+					});
+					if !is_pending {
+						fs::remove_file(path).ok();
+					}
+				}
+				true
+			},
+			_ => false,
+		}
+	}
 }
 
 #[cfg(feature = "tokio")]
@@ -486,48 +772,36 @@ impl KVStore for FilesystemStore {
 	fn write(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, buf: Vec<u8>,
 	) -> Pin<Box<dyn Future<Output = Result<(), lightning::io::Error>> + 'static + Send>> {
-		let this = Arc::clone(&self.inner);
-		let path = match this.get_checked_dest_file_path(
-			primary_namespace,
-			secondary_namespace,
-			Some(key),
-			"write",
-		) {
-			Ok(path) => path,
-			Err(e) => return Box::pin(async move { Err(e) }),
-		};
+		let mut operation =
+			match self.prepare_write(primary_namespace, secondary_namespace, key, buf) {
+				Ok(operation) => operation,
+				Err(e) => return Box::pin(async move { Err(e) }),
+			};
 
-		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(path.clone());
 		Box::pin(async move {
-			tokio::task::spawn_blocking(move || {
-				this.write_version(inner_lock_ref, path, buf, version)
-			})
-			.await
-			.unwrap_or_else(|e| Err(lightning::io::Error::new(lightning::io::ErrorKind::Other, e)))
+			tokio::task::spawn_blocking(move || operation.execute().map(|_| ()))
+				.await
+				.unwrap_or_else(|e| {
+					Err(lightning::io::Error::new(lightning::io::ErrorKind::Other, e))
+				})
 		})
 	}
 
 	fn remove(
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, lazy: bool,
 	) -> Pin<Box<dyn Future<Output = Result<(), lightning::io::Error>> + 'static + Send>> {
-		let this = Arc::clone(&self.inner);
-		let path = match this.get_checked_dest_file_path(
-			primary_namespace,
-			secondary_namespace,
-			Some(key),
-			"remove",
-		) {
-			Ok(path) => path,
-			Err(e) => return Box::pin(async move { Err(e) }),
-		};
+		let mut operation =
+			match self.prepare_remove(primary_namespace, secondary_namespace, key, lazy) {
+				Ok(operation) => operation,
+				Err(e) => return Box::pin(async move { Err(e) }),
+			};
 
-		let (inner_lock_ref, version) = self.get_new_version_and_lock_ref(path.clone());
 		Box::pin(async move {
-			tokio::task::spawn_blocking(move || {
-				this.remove_version(inner_lock_ref, path, lazy, version)
-			})
-			.await
-			.unwrap_or_else(|e| Err(lightning::io::Error::new(lightning::io::ErrorKind::Other, e)))
+			tokio::task::spawn_blocking(move || operation.execute().map(|_| ()))
+				.await
+				.unwrap_or_else(|e| {
+					Err(lightning::io::Error::new(lightning::io::ErrorKind::Other, e))
+				})
 		})
 	}
 
@@ -554,27 +828,8 @@ impl KVStore for FilesystemStore {
 	}
 }
 
-fn dir_entry_is_store_artifact(path: &Path) -> bool {
-	match path.extension().and_then(|ext| ext.to_str()) {
-		Some("tmp") => true,
-		Some("trash") => {
-			#[cfg(target_os = "windows")]
-			{
-				// Clean up any trash files lying around.
-				fs::remove_file(path).ok();
-			}
-			true
-		},
-		_ => false,
-	}
-}
-
 fn dir_entry_is_key(dir_entry: &fs::DirEntry) -> Result<bool, lightning::io::Error> {
 	let p = dir_entry.path();
-	if dir_entry_is_store_artifact(&p) {
-		return Ok(false);
-	}
-
 	let metadata = dir_entry.metadata()?;
 
 	// We allow the presence of directories in the empty primary namespace and just skip them.
@@ -659,7 +914,7 @@ impl MigratableKVStore for FilesystemStore {
 		'primary_loop: for primary_entry in fs::read_dir(prefixed_dest)? {
 			let primary_entry = primary_entry?;
 			let primary_path = primary_entry.path();
-			if dir_entry_is_store_artifact(&primary_path) {
+			if self.inner.dir_entry_is_store_artifact(&primary_path) {
 				continue 'primary_loop;
 			}
 
@@ -675,7 +930,7 @@ impl MigratableKVStore for FilesystemStore {
 			'secondary_loop: for secondary_entry in fs::read_dir(&primary_path)? {
 				let secondary_entry = secondary_entry?;
 				let secondary_path = secondary_entry.path();
-				if dir_entry_is_store_artifact(&secondary_path) {
+				if self.inner.dir_entry_is_store_artifact(&secondary_path) {
 					continue 'secondary_loop;
 				}
 
@@ -692,7 +947,7 @@ impl MigratableKVStore for FilesystemStore {
 				for tertiary_entry in fs::read_dir(&secondary_path)? {
 					let tertiary_entry = tertiary_entry?;
 					let tertiary_path = tertiary_entry.path();
-					if dir_entry_is_store_artifact(&tertiary_path) {
+					if self.inner.dir_entry_is_store_artifact(&tertiary_path) {
 						continue;
 					}
 
@@ -740,6 +995,7 @@ mod tests {
 	use lightning::ln::msgs::BaseMessageHandler;
 	use lightning::util::persist::read_channel_monitors;
 	use lightning::util::test_utils;
+	use std::sync::Barrier;
 
 	impl Drop for FilesystemStore {
 		fn drop(&mut self) {
@@ -750,6 +1006,296 @@ mod tests {
 				_ => {},
 			}
 		}
+	}
+
+	fn new_test_store(test_name: &str) -> FilesystemStore {
+		let data_dir = std::env::temp_dir().join(test_name);
+		fs::remove_dir_all(&data_dir).ok();
+		fs::create_dir_all(&data_dir).unwrap();
+		FilesystemStore::new(data_dir)
+	}
+
+	fn assert_no_temporary_files(directory: &Path) {
+		let temporary_files = fs::read_dir(directory)
+			.unwrap()
+			.filter_map(Result::ok)
+			.map(|entry| entry.path())
+			.filter(|path| path.extension().map_or(false, |extension| extension == "tmp"))
+			.collect::<Vec<_>>();
+		assert!(temporary_files.is_empty(), "unexpected temporary files: {temporary_files:?}");
+	}
+
+	#[test]
+	fn prepared_operations_preserve_order_and_allow_same_version_retry() {
+		let fs_store = new_test_store("test_prepared_operations_preserve_order");
+		let parent = fs_store.get_data_dir().join("primary").join("secondary");
+		let dest_file_path = parent.join("key");
+		fs::create_dir_all(&dest_file_path).unwrap();
+
+		let mut retrying_write =
+			fs_store.prepare_write("primary", "secondary", "key", b"older".to_vec()).unwrap();
+		assert!(retrying_write.execute().is_err());
+		assert_no_temporary_files(&parent);
+
+		fs::remove_dir(&dest_file_path).unwrap();
+		assert_eq!(retrying_write.execute().unwrap(), FilesystemStoreOperationStatus::Applied);
+		assert_eq!(fs::read(&dest_file_path).unwrap(), b"older");
+
+		let mut older =
+			fs_store.prepare_write("primary", "secondary", "other_key", b"older".to_vec()).unwrap();
+		let mut newer =
+			fs_store.prepare_write("primary", "secondary", "other_key", b"newer".to_vec()).unwrap();
+		let other_dest_file_path = parent.join("other_key");
+		fs::create_dir(&other_dest_file_path).unwrap();
+		assert!(newer.execute().is_err());
+		assert_no_temporary_files(&parent);
+
+		// The newer write failed before changing the destination, so the older write can still
+		// apply safely. It must actually write the file rather than report a false success.
+		fs::remove_dir(&other_dest_file_path).unwrap();
+		assert_eq!(older.execute().unwrap(), FilesystemStoreOperationStatus::Applied);
+		assert_eq!(fs::read(&other_dest_file_path).unwrap(), b"older");
+
+		assert_eq!(newer.execute().unwrap(), FilesystemStoreOperationStatus::Applied);
+		assert_eq!(fs::read(&other_dest_file_path).unwrap(), b"newer");
+		assert_eq!(older.execute().unwrap(), FilesystemStoreOperationStatus::Superseded);
+
+		let mut final_write =
+			fs_store.prepare_write("primary", "secondary", "key", b"newer".to_vec()).unwrap();
+		fs::remove_file(&dest_file_path).unwrap();
+		fs::create_dir(&dest_file_path).unwrap();
+		assert!(final_write.execute().is_err());
+		assert_no_temporary_files(&parent);
+
+		fs::remove_dir(&dest_file_path).unwrap();
+		assert_eq!(final_write.execute().unwrap(), FilesystemStoreOperationStatus::Applied);
+		assert_eq!(fs::read(&dest_file_path).unwrap(), b"newer");
+	}
+
+	#[test]
+	fn prepared_operations_execute_in_reverse_invocation_order() {
+		let fs_store = new_test_store("test_prepared_operations_reverse_order");
+		let dest_file_path = fs_store.get_data_dir().join("primary").join("key");
+		let mut older = fs_store.prepare_write("primary", "", "key", b"older".to_vec()).unwrap();
+		let mut newer = fs_store.prepare_write("primary", "", "key", b"newer".to_vec()).unwrap();
+
+		assert_eq!(newer.execute().unwrap(), FilesystemStoreOperationStatus::Applied);
+		assert_eq!(older.execute().unwrap(), FilesystemStoreOperationStatus::Superseded);
+		assert_eq!(fs::read(dest_file_path).unwrap(), b"newer");
+		assert_no_temporary_files(&fs_store.get_data_dir().join("primary"));
+	}
+
+	#[test]
+	fn concurrently_dropped_operations_clean_their_lock_state() {
+		let fs_store = new_test_store("test_concurrent_operation_cleanup");
+		let first = fs_store.prepare_remove("primary", "", "key", false).unwrap();
+		let second = fs_store.prepare_remove("primary", "", "key", false).unwrap();
+		let barrier = Arc::new(Barrier::new(3));
+
+		std::thread::scope(|scope| {
+			let first_barrier = Arc::clone(&barrier);
+			scope.spawn(move || {
+				first_barrier.wait();
+				drop(first);
+			});
+			let second_barrier = Arc::clone(&barrier);
+			scope.spawn(move || {
+				second_barrier.wait();
+				drop(second);
+			});
+			barrier.wait();
+		});
+
+		assert!(fs_store.inner.locks.lock().unwrap().is_empty());
+	}
+
+	#[test]
+	fn version_overflow_does_not_wrap_or_leak_lock_state() {
+		let fs_store = new_test_store("test_prepared_operation_version_overflow");
+		fs_store.next_version.store(u64::MAX, Ordering::Relaxed);
+		let result = std::panic::catch_unwind(|| {
+			fs_store.prepare_remove("primary", "", "key", false).unwrap();
+		});
+
+		assert!(result.is_err());
+		assert_eq!(fs_store.next_version.load(Ordering::Relaxed), u64::MAX);
+		assert!(fs_store.inner.locks.lock().unwrap().is_empty());
+	}
+
+	#[cfg(not(target_os = "windows"))]
+	#[test]
+	fn same_remove_token_retries_pending_directory_sync_after_unlink() {
+		let fs_store = new_test_store("test_durable_remove_retries_directory_sync");
+		KVStoreSync::write(&fs_store, "primary", "", "key", b"value".to_vec()).unwrap();
+		let mut remove = fs_store.prepare_remove("primary", "", "key", false).unwrap();
+		let dest_file_path = fs_store.get_data_dir().join("primary").join("key");
+
+		fs::remove_file(&dest_file_path).unwrap();
+		{
+			let mut state = remove.operation.inner_lock_ref.as_ref().unwrap().write().unwrap();
+			state.latest_operation = Some(FilesystemStoreOperationAttempt {
+				version: remove.operation.version,
+				status: FilesystemStoreOperationAttemptStatus::Failed,
+			});
+			state.pending_directory_sync_version = Some(remove.operation.version);
+		}
+
+		assert_eq!(remove.execute().unwrap(), FilesystemStoreOperationStatus::Applied);
+		assert!(!remove
+			.operation
+			.inner_lock_ref
+			.as_ref()
+			.unwrap()
+			.read()
+			.unwrap()
+			.pending_directory_sync_version
+			.is_some());
+		drop(remove);
+		assert!(fs_store.inner.locks.lock().unwrap().is_empty());
+	}
+
+	#[cfg(not(target_os = "windows"))]
+	#[test]
+	fn older_operation_waits_for_newer_pending_durability() {
+		let fs_store = new_test_store("test_older_waits_for_newer_pending_durability");
+		KVStoreSync::write(&fs_store, "primary", "", "key", b"initial".to_vec()).unwrap();
+		let mut older = fs_store.prepare_write("primary", "", "key", b"older".to_vec()).unwrap();
+		let newer = fs_store.prepare_remove("primary", "", "key", false).unwrap();
+		let parent = fs_store.get_data_dir().join("primary");
+		let unavailable_parent = fs_store.get_data_dir().join("primary-unavailable");
+		let dest_file_path = parent.join("key");
+
+		// Model a remove which unlinked the destination and then failed to sync its parent.
+		fs::remove_file(&dest_file_path).unwrap();
+		{
+			let mut state = newer.operation.inner_lock_ref.as_ref().unwrap().write().unwrap();
+			state.latest_operation = Some(FilesystemStoreOperationAttempt {
+				version: newer.operation.version,
+				status: FilesystemStoreOperationAttemptStatus::Failed,
+			});
+			state.pending_directory_sync_version = Some(newer.operation.version);
+		}
+		drop(newer);
+		assert_eq!(fs_store.inner.locks.lock().unwrap().len(), 1);
+		fs::rename(&parent, &unavailable_parent).unwrap();
+
+		// The older write must surface the failed durability retry, not return success while the
+		// destination is absent or overwrite the newer mutation.
+		assert!(older.execute().is_err());
+		assert!(!dest_file_path.exists());
+
+		fs::rename(&unavailable_parent, &parent).unwrap();
+		assert_eq!(older.execute().unwrap(), FilesystemStoreOperationStatus::Superseded);
+		assert!(!dest_file_path.exists());
+	}
+
+	#[cfg(target_os = "windows")]
+	#[test]
+	fn durable_remove_retries_pending_trash_sync() {
+		let fs_store = new_test_store("test_durable_remove_retries_pending_trash_sync");
+		let mut remove = fs_store.prepare_remove("primary", "", "key", false).unwrap();
+		let parent = fs_store.get_data_dir().join("primary");
+		fs::create_dir_all(&parent).unwrap();
+		let trash_file_path = parent.join("key.0.trash");
+
+		// A directory cannot be opened as the read/write file whose metadata must be synced. This
+		// models MoveFileEx succeeding before the trash open or sync fails.
+		fs::create_dir(&trash_file_path).unwrap();
+		{
+			let mut state = remove.operation.inner_lock_ref.as_ref().unwrap().write().unwrap();
+			state.latest_operation = Some(FilesystemStoreOperationAttempt {
+				version: remove.operation.version,
+				status: FilesystemStoreOperationAttemptStatus::Failed,
+			});
+			state.pending_file_sync = Some(PendingWindowsFileSync {
+				version: remove.operation.version,
+				path: trash_file_path.clone(),
+				remove_after_sync: true,
+			});
+		}
+		assert!(remove.execute().is_err());
+
+		fs::remove_dir(&trash_file_path).unwrap();
+		fs::write(&trash_file_path, b"removed data").unwrap();
+		assert_eq!(remove.execute().unwrap(), FilesystemStoreOperationStatus::Applied);
+		assert!(!trash_file_path.exists());
+	}
+
+	#[cfg(target_os = "windows")]
+	#[test]
+	fn listing_does_not_delete_pending_trash_file() {
+		let fs_store = new_test_store("test_listing_preserves_pending_trash");
+		let remove = fs_store.prepare_remove("primary", "", "key", false).unwrap();
+		let parent = fs_store.get_data_dir().join("primary");
+		fs::create_dir_all(&parent).unwrap();
+		let trash_file_path = parent.join("key.0.trash");
+		fs::write(&trash_file_path, b"removed data").unwrap();
+		{
+			let mut state = remove.operation.inner_lock_ref.as_ref().unwrap().write().unwrap();
+			state.pending_file_sync = Some(PendingWindowsFileSync {
+				version: remove.operation.version,
+				path: trash_file_path.clone(),
+				remove_after_sync: true,
+			});
+		}
+
+		assert!(fs_store.inner.list(parent).unwrap().is_empty());
+		assert!(trash_file_path.exists());
+		remove.operation.inner_lock_ref.as_ref().unwrap().write().unwrap().pending_file_sync = None;
+		assert!(fs_store.inner.list(fs_store.get_data_dir().join("primary")).unwrap().is_empty());
+		assert!(!trash_file_path.exists());
+	}
+
+	#[cfg(feature = "tokio")]
+	#[tokio::test]
+	async fn async_write_does_not_report_false_success_after_newer_pre_mutation_failure() {
+		let fs_store = Arc::new(new_test_store("test_async_write_after_newer_failure"));
+		let async_fs_store: Arc<dyn KVStore> = fs_store.clone();
+		let older = async_fs_store.write("primary", "", "key", b"older".to_vec());
+		let mut newer = fs_store.prepare_write("primary", "", "key", b"newer".to_vec()).unwrap();
+		let parent = fs_store.get_data_dir().join("primary");
+		let dest_file_path = parent.join("key");
+		fs::create_dir_all(&dest_file_path).unwrap();
+
+		assert!(newer.execute().is_err());
+		fs::remove_dir(&dest_file_path).unwrap();
+		older.await.unwrap();
+		assert_eq!(fs::read(&dest_file_path).unwrap(), b"older");
+
+		assert_eq!(newer.execute().unwrap(), FilesystemStoreOperationStatus::Applied);
+		assert_eq!(fs::read(dest_file_path).unwrap(), b"newer");
+	}
+
+	#[cfg(all(feature = "tokio", not(target_os = "windows")))]
+	#[tokio::test]
+	async fn async_write_errors_while_newer_durability_is_pending() {
+		let fs_store = Arc::new(new_test_store("test_async_write_while_durability_pending"));
+		KVStoreSync::write(&*fs_store, "primary", "", "key", b"initial".to_vec()).unwrap();
+		let async_fs_store: Arc<dyn KVStore> = fs_store.clone();
+		let older = async_fs_store.write("primary", "", "key", b"older".to_vec());
+		let newer = fs_store.prepare_remove("primary", "", "key", false).unwrap();
+		let parent = fs_store.get_data_dir().join("primary");
+		let unavailable_parent = fs_store.get_data_dir().join("primary-unavailable");
+		let dest_file_path = parent.join("key");
+
+		fs::remove_file(&dest_file_path).unwrap();
+		{
+			let mut state = newer.operation.inner_lock_ref.as_ref().unwrap().write().unwrap();
+			state.latest_operation = Some(FilesystemStoreOperationAttempt {
+				version: newer.operation.version,
+				status: FilesystemStoreOperationAttemptStatus::Failed,
+			});
+			state.pending_directory_sync_version = Some(newer.operation.version);
+		}
+		drop(newer);
+		fs::rename(&parent, &unavailable_parent).unwrap();
+
+		assert!(older.await.is_err());
+		assert!(!dest_file_path.exists());
+
+		fs::rename(&unavailable_parent, &parent).unwrap();
+		let mut recovery = fs_store.prepare_remove("primary", "", "key", false).unwrap();
+		assert_eq!(recovery.execute().unwrap(), FilesystemStoreOperationStatus::Applied);
 	}
 
 	#[test]

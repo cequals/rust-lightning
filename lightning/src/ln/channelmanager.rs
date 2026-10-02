@@ -6842,6 +6842,16 @@ where
 		Ok(())
 	}
 
+	/// Returns the amount received for an intercepted HTLC while it is pending.
+	#[doc(hidden)]
+	pub fn intercepted_htlc_inbound_amount_msat(&self, intercept_id: InterceptId) -> Option<u64> {
+		self.pending_intercepted_htlcs
+			.lock()
+			.unwrap()
+			.get(&intercept_id)
+			.and_then(|payment| payment.forward_info.incoming_amt_msat)
+	}
+
 	/// Fails the intercepted HTLC indicated by intercept_id. Should only be called in response to
 	/// an [`HTLCIntercepted`] event. See [`ChannelManager::forward_intercepted_htlc`].
 	///
@@ -7769,8 +7779,10 @@ where
 						counterparty_skimmed_fee_msat: skimmed_fee_msat,
 					};
 
+					let mut just_added = false;
 					let mut committed_to_claimable = false;
 
+					let mut claimable_payments = self.claimable_payments.lock().unwrap();
 					macro_rules! fail_htlc {
 						($htlc: expr, $payment_hash: expr) => {
 							debug_assert!(!committed_to_claimable);
@@ -7802,6 +7814,9 @@ where
 								),
 								HTLCHandlingFailureType::Receive { payment_hash: $payment_hash },
 							));
+							if just_added {
+								claimable_payments.claimable_payments.remove(&payment_hash);
+							}
 							continue 'next_forwardable_htlc;
 						};
 					}
@@ -7818,7 +7833,6 @@ where
 						($purpose: expr) => {{
 							let mut payment_claimable_generated = false;
 							let is_keysend = $purpose.is_keysend();
-							let mut claimable_payments = self.claimable_payments.lock().unwrap();
 							if claimable_payments.pending_claiming_payments.contains_key(&payment_hash) {
 								fail_htlc!(claimable_htlc, payment_hash);
 							}
@@ -7826,7 +7840,7 @@ where
 								.entry(payment_hash)
 								// Note that if we insert here we MUST NOT fail_htlc!()
 								.or_insert_with(|| {
-									committed_to_claimable = true;
+									just_added = true;
 									ClaimablePayment {
 										purpose: $purpose.clone(), htlcs: Vec::new(), onion_fields: None,
 									}
@@ -14135,16 +14149,23 @@ where
 	L::Target: Logger,
 {
 	fn filtered_block_connected(&self, header: &Header, txdata: &TransactionData, height: u32) {
-		{
+		let is_rescan = {
 			let best_block = self.best_block.read().unwrap();
-			assert_eq!(best_block.block_hash, header.prev_blockhash,
-				"Blocks must be connected in chain-order - the connected header must build on the last connected header");
-			assert_eq!(best_block.height, height - 1,
-				"Blocks must be connected in chain-order - the connected block height must be one greater than the previous height");
-		}
+			let is_rescan =
+				best_block.block_hash == header.block_hash() && best_block.height == height;
+			if !is_rescan {
+				assert_eq!(best_block.block_hash, header.prev_blockhash,
+					"Blocks must be connected in chain-order - the connected header must build on the last connected header");
+				assert_eq!(best_block.height, height - 1,
+					"Blocks must be connected in chain-order - the connected block height must be one greater than the previous height");
+			}
+			is_rescan
+		};
 
 		self.transactions_confirmed(header, txdata, height);
-		self.best_block_updated(header, height);
+		if !is_rescan {
+			self.best_block_updated(header, height);
+		}
 	}
 
 	fn blocks_disconnected(&self, fork_point: BestBlock) {
@@ -16340,13 +16361,14 @@ where
 		// Since some FundingNegotiation variants are not persisted, any splice in such state must
 		// be failed upon reload. However, as the necessary information for the SpliceFailed event
 		// is not persisted, the event itself needs to be persisted even though it hasn't been
-		// emitted yet. These are removed after the events are written.
-		let mut events = self.pending_events.lock().unwrap();
-		let event_count = events.len();
+		// emitted yet.
+		// They are written alongside the pending events below but never added to them, as writing
+		// may fail.
+		let mut splice_failed_events: Vec<(Event, Option<EventCompletionAction>)> = Vec::new();
 		for peer_state in peer_states.iter() {
 			for chan in peer_state.channel_by_id.values().filter_map(Channel::as_funded) {
 				if let Some(splice_funding_failed) = chan.maybe_splice_funding_failed() {
-					events.push_back((
+					splice_failed_events.push((
 						events::Event::SpliceFailed {
 							channel_id: chan.context.channel_id(),
 							counterparty_node_id: chan.context.get_counterparty_node_id(),
@@ -16361,6 +16383,7 @@ where
 				}
 			}
 		}
+		let events = self.pending_events.lock().unwrap();
 
 		// LDK versions prior to 0.0.115 don't support post-event actions, thus if there's no
 		// actions at all, skip writing the required TLV. Otherwise, pre-0.0.115 versions will
@@ -16371,8 +16394,8 @@ where
 			// well save the space and not write any events here.
 			0u64.write(writer)?;
 		} else {
-			(events.len() as u64).write(writer)?;
-			for (event, _) in events.iter() {
+			((events.len() + splice_failed_events.len()) as u64).write(writer)?;
+			for (event, _) in events.iter().chain(splice_failed_events.iter()) {
 				event.write(writer)?;
 			}
 		}
@@ -16458,6 +16481,11 @@ where
 			}
 		}
 
+		let pending_events_writer = PendingEventsWriter {
+			pending_events: &*events,
+			splice_failed_events: &splice_failed_events,
+		};
+
 		write_tlv_fields!(writer, {
 			(1, pending_outbound_payments_no_retry, required),
 			(2, pending_intercepted_htlcs, option),
@@ -16466,7 +16494,7 @@ where
 			(5, self.our_network_pubkey, required),
 			(6, monitor_update_blocked_actions_per_peer, option),
 			(7, self.fake_scid_rand_bytes, required),
-			(8, if events_not_backwards_compatible { Some(&*events) } else { None }, option),
+			(8, if events_not_backwards_compatible { Some(&pending_events_writer) } else { None }, option),
 			(9, htlc_purposes, required_vec),
 			(10, legacy_in_flight_monitor_updates, option),
 			(11, self.probing_cookie_secret, required),
@@ -16478,17 +16506,22 @@ where
 			(21, WithoutLength(&self.flow.writeable_async_receive_offer_cache()), required),
 		});
 
-		// Remove the SpliceFailed events added earlier.
-		events.truncate(event_count);
-
 		Ok(())
 	}
 }
 
-impl Writeable for VecDeque<(Event, Option<EventCompletionAction>)> {
+/// Writes the pending events of a [`ChannelManager`] chained with any events that are only
+/// generated at serialization time, as if they were a single sequence of events.
+struct PendingEventsWriter<'a> {
+	pending_events: &'a VecDeque<(Event, Option<EventCompletionAction>)>,
+	splice_failed_events: &'a [(Event, Option<EventCompletionAction>)],
+}
+
+impl Writeable for PendingEventsWriter<'_> {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
-		(self.len() as u64).write(w)?;
-		for (event, action) in self.iter() {
+		let Self { pending_events, splice_failed_events } = self;
+		((pending_events.len() + splice_failed_events.len()) as u64).write(w)?;
+		for (event, action) in pending_events.iter().chain(splice_failed_events.iter()) {
 			event.write(w)?;
 			action.write(w)?;
 			#[cfg(debug_assertions)]
@@ -16803,6 +16836,14 @@ where
 			let channel_id = channel.context.channel_id();
 			channel_id_set.insert(channel_id);
 			if let Some(ref mut monitor) = args.channel_monitors.get_mut(&channel_id) {
+				// Blocked updates the `ChannelMonitor` has since applied must be dropped before
+				// checking whether we're stale, as force-closing a stale channel fails back the
+				// HTLCs added in its blocked updates, which the counterparty is committed to if
+				// the update was applied.
+				channel.on_startup_drop_completed_blocked_mon_updates_through(
+					&logger,
+					monitor.get_latest_update_id(),
+				);
 				if channel.get_cur_holder_commitment_transaction_number()
 					> monitor.get_cur_holder_commitment_number()
 					|| channel.get_revoked_counterparty_commitment_transaction_number()
@@ -16925,10 +16966,6 @@ where
 						}
 					}
 				} else {
-					channel.on_startup_drop_completed_blocked_mon_updates_through(
-						&logger,
-						monitor.get_latest_update_id(),
-					);
 					log_info!(logger, "Successfully loaded channel {} at update_id {} against monitor at update id {} with {} blocked updates",
 						&channel.context.channel_id(), channel.context.get_latest_monitor_update_id(),
 						monitor.get_latest_update_id(), channel.blocked_monitor_updates_pending());
@@ -17034,6 +17071,7 @@ where
 					update_id: monitor.get_latest_update_id().saturating_add(1),
 					updates: vec![ChannelMonitorUpdateStep::ChannelForceClosed {
 						should_broadcast: true,
+						counterparty_failed_htlcs: Vec::new(),
 					}],
 					channel_id: Some(monitor.channel_id()),
 				};
@@ -17864,6 +17902,9 @@ where
 					.into_iter()
 					.zip(onion_fields.into_iter().zip(claimable_htlcs_list.into_iter()))
 				{
+					if htlcs.is_empty() {
+						continue;
+					}
 					let claimable = ClaimablePayment { purpose, htlcs, onion_fields: onion };
 					let existing_payment = claimable_payments.insert(payment_hash, claimable);
 					if existing_payment.is_some() {
@@ -17874,6 +17915,9 @@ where
 				for (purpose, (payment_hash, htlcs)) in
 					purposes.into_iter().zip(claimable_htlcs_list.into_iter())
 				{
+					if htlcs.is_empty() {
+						continue;
+					}
 					let claimable = ClaimablePayment { purpose, htlcs, onion_fields: None };
 					let existing_payment = claimable_payments.insert(payment_hash, claimable);
 					if existing_payment.is_some() {

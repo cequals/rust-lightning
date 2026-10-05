@@ -4021,6 +4021,13 @@ where
 			&& !self.monitor_pending_channel_ready
 	}
 
+	/// Returns true if this channel is fully established, even if it is closing. HTLCs may still
+	/// be failed or claimed over a closing channel, so its outbound SCID alias must stay mapped.
+	pub fn is_ready_ignoring_shutdown(&self) -> bool {
+		matches!(self.channel_state, ChannelState::ChannelReady(_))
+			&& !self.monitor_pending_channel_ready
+	}
+
 	/// shutdown state returns the state of the channel in its various stages of shutdown
 	pub fn shutdown_state(&self) -> ChannelShutdownState {
 		match self.channel_state {

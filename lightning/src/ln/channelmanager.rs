@@ -18039,7 +18039,7 @@ where
 						);
 						return Err(DecodeError::InvalidValue);
 					}
-					if funded_chan.context.is_usable() {
+					if funded_chan.context.is_ready_ignoring_shutdown() {
 						let alias = funded_chan.context.outbound_scid_alias();
 						let cp_id = funded_chan.context.get_counterparty_node_id();
 						if short_to_chan_info.insert(alias, (cp_id, *chan_id)).is_some() {

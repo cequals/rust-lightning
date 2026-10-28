@@ -31,7 +31,7 @@ use crate::util::config::{
 	ChannelConfigOverrides, ChannelConfigUpdate, ChannelHandshakeConfigUpdate, UserConfig,
 };
 use crate::util::errors::APIError;
-use crate::util::test_utils::{self, TestLogger};
+use crate::util::test_utils::{self, SignerCall, SignerCallKind, TestLogger};
 
 use bitcoin::constants::ChainHash;
 use bitcoin::hashes::Hash;
@@ -2631,4 +2631,123 @@ fn test_fund_pending_channel() {
 		err: "Error in transaction funding: Misuse error: Channel f7fee84016d554015f5166c0a0df6479942ef55fd70713883b0493493a38e13a with counterparty 0355f8d2238a322d16b602bd0ceaad5b01019fb055971eaadcc9b29226a4da6c23 is not an unfunded, outbound channel ready to fund".to_owned(),
 	};
 	check_closed_event!(nodes[0], 1, reason, [node_b_id], 100_000);
+}
+
+// The tests below with the prefix `close_script_contract_` pin the call order of the fork that
+// `lightning-node` needs for its close scripts. Its `SignerProvider` gives a channel its close
+// script in `get_shutdown_scriptpubkey`, which gets no channel argument. It finds the channel with
+// a thread-local value that its `generate_channel_keys_id` sets. Run all of them before each change
+// of the fork revision in `lightning-node`: `cargo test -p lightning --lib close_script_contract_`.
+// The recorder keeps the thread and the kind of each call, not its arguments.
+
+/// Returns the kind of each call in `calls`, oldest first.
+fn signer_call_kinds(calls: &[SignerCall]) -> Vec<SignerCallKind> {
+	calls.iter().map(|call| call.kind).collect()
+}
+
+/// Checks the signer calls of one channel creation: `calls` are the calls that the node made in
+/// one `create_channel` call, in one `accept_inbound_channel` call, or in one `handle_open_channel`
+/// call that makes the channel. The test thread made that LDK call. Each call of `calls` ran on
+/// `thread`, and thus ran before the LDK call returned.
+fn check_creation_signer_calls(calls: &[SignerCall], thread: std::thread::ThreadId) {
+	let kinds = signer_call_kinds(calls);
+	// No keys-ID call and no script call comes twice. A second keys-ID call between the two script
+	// calls would give the shutdown call the wrong channel.
+	for kind in [
+		SignerCallKind::GenerateChannelKeysId,
+		SignerCallKind::GetShutdownScriptpubkey,
+		SignerCallKind::GetDestinationScript,
+	] {
+		assert_eq!(kinds.iter().filter(|k| **k == kind).count(), 1, "{kind:?} in {kinds:?}");
+	}
+	assert!(calls.iter().all(|call| call.thread == thread), "{calls:?}");
+	// The keys ID comes first: the destination script call needs it, and the shutdown call
+	// needs the value that the keys-ID call sets.
+	assert_eq!(kinds[0], SignerCallKind::GenerateChannelKeysId, "{kinds:?}");
+}
+
+#[test]
+fn close_script_contract_create_channel_call_order() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// The test thread runs `create_channel`. Thus a call on this thread between the two
+	// `take_signer_calls` calls ran before `create_channel` returned.
+	let thread = std::thread::current().id();
+	nodes[0].keys_manager.take_signer_calls();
+	nodes[0].node.create_channel(node_b_id, 100_000, 0, 42, None, None).unwrap();
+	let calls = nodes[0].keys_manager.take_signer_calls();
+	check_creation_signer_calls(&calls, thread);
+
+	get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, node_b_id);
+}
+
+#[test]
+fn close_script_contract_accept_inbound_channel_call_order() {
+	// `accept_inbound_channel` makes the channel only for a node that sets
+	// `manually_accept_inbound_channels`. Any other node makes the channel in `handle_open_channel`.
+	let mut manual_accept_config = test_default_channel_config();
+	manual_accept_config.manually_accept_inbound_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, Some(manual_accept_config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	nodes[0].node.create_channel(node_b_id, 100_000, 0, 42, None, None).unwrap();
+	let open_channel_msg = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, node_b_id);
+
+	// `handle_open_channel` only queues an event. It makes no channel and makes no signer call.
+	nodes[1].keys_manager.take_signer_calls();
+	nodes[1].node.handle_open_channel(node_a_id, &open_channel_msg);
+	assert!(nodes[1].keys_manager.take_signer_calls().is_empty());
+	let events = nodes[1].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	let temporary_channel_id = match events[0] {
+		Event::OpenChannelRequest { temporary_channel_id, .. } => temporary_channel_id,
+		_ => panic!("Unexpected event"),
+	};
+
+	let thread = std::thread::current().id();
+	nodes[1].node.accept_inbound_channel(&temporary_channel_id, &node_a_id, 23, None).unwrap();
+	let calls = nodes[1].keys_manager.take_signer_calls();
+	check_creation_signer_calls(&calls, thread);
+
+	get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, node_a_id);
+}
+
+#[test]
+fn close_script_contract_scripts_are_read_at_creation_only() {
+	// The `lightning-node` provider has a close script for a channel only while LDK makes the
+	// channel. A script call at any later point, for example at `channel_ready` or at the close,
+	// would get the scripts of the node wallet and not the close script.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let thread = std::thread::current().id();
+
+	// This open has the funding, the `channel_ready` messages and the announcements. Both nodes make
+	// the three calls one time. This node b makes the channel in `handle_open_channel`.
+	let chan = create_announced_chan_between_nodes(&nodes, 0, 1);
+	for node in nodes.iter() {
+		check_creation_signer_calls(&node.keys_manager.take_signer_calls(), thread);
+	}
+
+	// A cooperative close sends the script of the channel from the creation. It makes no call.
+	close_channel(&nodes[0], &nodes[1], &chan.2, chan.3, true);
+	let node_a_reason = ClosureReason::CounterpartyInitiatedCooperativeClosure;
+	check_closed_event!(nodes[0], 1, node_a_reason, [node_b_id], 100000);
+	let node_b_reason = ClosureReason::LocallyInitiatedCooperativeClosure;
+	check_closed_event!(nodes[1], 1, node_b_reason, [node_a_id], 100000);
+	for node in nodes.iter() {
+		assert_eq!(node.keys_manager.take_signer_calls(), Vec::new());
+	}
 }

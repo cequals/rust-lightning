@@ -1800,6 +1800,26 @@ impl NodeSigner for TestNodeSigner {
 	}
 }
 
+/// The kind of a [`SignerProvider`] call that [`TestKeysInterface`] records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignerCallKind {
+	/// A call of [`SignerProvider::generate_channel_keys_id`].
+	GenerateChannelKeysId,
+	/// A call of [`SignerProvider::get_shutdown_scriptpubkey`].
+	GetShutdownScriptpubkey,
+	/// A call of [`SignerProvider::get_destination_script`].
+	GetDestinationScript,
+}
+
+/// A [`SignerProvider`] call that [`TestKeysInterface`] recorded, with the thread that made it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignerCall {
+	/// The thread that made the call.
+	pub thread: std::thread::ThreadId,
+	/// The method that the call used.
+	pub kind: SignerCallKind,
+}
+
 pub struct TestKeysInterface {
 	pub backing: DynKeysInterface,
 	pub override_random_bytes: Mutex<Option<[u8; 32]>>,
@@ -1810,6 +1830,7 @@ pub struct TestKeysInterface {
 	pub unavailable_signers_ops: Mutex<HashMap<[u8; 32], HashSet<SignerOp>>>,
 	pub next_signer_disabled_ops: Mutex<HashSet<SignerOp>>,
 	pub override_next_keys_id: Mutex<Option<[u8; 32]>>,
+	signer_calls: Mutex<Vec<SignerCall>>,
 }
 
 impl EntropySource for TestKeysInterface {
@@ -1872,6 +1893,7 @@ impl SignerProvider for TestKeysInterface {
 	type TaprootSigner = TestChannelSigner;
 
 	fn generate_channel_keys_id(&self, inbound: bool, user_channel_id: u128) -> [u8; 32] {
+		self.record_signer_call(SignerCallKind::GenerateChannelKeysId);
 		let mut override_keys = self.override_next_keys_id.lock().unwrap();
 
 		if let Some(keys_id) = *override_keys {
@@ -1902,10 +1924,12 @@ impl SignerProvider for TestKeysInterface {
 	}
 
 	fn get_destination_script(&self, channel_keys_id: [u8; 32]) -> Result<ScriptBuf, ()> {
+		self.record_signer_call(SignerCallKind::GetDestinationScript);
 		self.backing.get_destination_script(channel_keys_id)
 	}
 
 	fn get_shutdown_scriptpubkey(&self) -> Result<ShutdownScript, ()> {
+		self.record_signer_call(SignerCallKind::GetShutdownScriptpubkey);
 		match &mut *self.expectations.lock().unwrap() {
 			None => self.backing.get_shutdown_scriptpubkey(),
 			Some(expectations) => match expectations.pop_front() {
@@ -1959,6 +1983,7 @@ impl TestKeysInterface {
 			unavailable_signers_ops: Mutex::new(new_hash_map()),
 			next_signer_disabled_ops: Mutex::new(new_hash_set()),
 			override_next_keys_id: Mutex::new(None),
+			signer_calls: Mutex::new(Vec::new()),
 		}
 	}
 
@@ -2014,6 +2039,17 @@ impl TestKeysInterface {
 	pub fn set_next_keys_id(&self, keys_id: [u8; 32]) -> &Self {
 		*self.override_next_keys_id.lock().unwrap() = Some(keys_id);
 		self
+	}
+
+	fn record_signer_call(&self, kind: SignerCallKind) {
+		let call = SignerCall { thread: std::thread::current().id(), kind };
+		self.signer_calls.lock().unwrap().push(call);
+	}
+
+	/// Returns the [`SignerProvider`] calls that this object recorded since the last call of this
+	/// method, oldest first.
+	pub fn take_signer_calls(&self) -> Vec<SignerCall> {
+		mem::take(&mut *self.signer_calls.lock().unwrap())
 	}
 }
 

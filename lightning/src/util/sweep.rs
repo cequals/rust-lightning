@@ -1131,8 +1131,10 @@ mod tests {
 	use crate::sign::{ChangeDestinationSource, OutputSpender};
 	use crate::util::async_poll::dummy_waker;
 	use crate::util::logger::Record;
+	use crate::util::test_utils::{TestBroadcaster, TestStore};
 
 	use bitcoin::hashes::Hash as _;
+	use bitcoin::network::Network;
 	use bitcoin::secp256k1::All;
 	use bitcoin::transaction::Version;
 	use bitcoin::{Amount, BlockHash, ScriptBuf, Transaction, TxOut, Txid};
@@ -1321,5 +1323,353 @@ mod tests {
 				..
 			} if confirmation_hash == header.block_hash()
 		));
+	}
+
+	/// A spender that leaves one output out of each transaction. It records the outpoints that the
+	/// sweeper gives it. It gives `Err` when it has no other output to spend.
+	struct LeaveOneOutSpender {
+		left_out: bitcoin::OutPoint,
+		offered: Mutex<Vec<Vec<bitcoin::OutPoint>>>,
+	}
+
+	impl LeaveOneOutSpender {
+		fn new(left_out: OutPoint) -> Self {
+			Self { left_out: left_out.into_bitcoin_outpoint(), offered: Mutex::new(Vec::new()) }
+		}
+
+		/// Returns the outpoints of each call since the last call of this method. The outpoints of
+		/// one call are in order, as the sweeper gives the descriptors in a random order.
+		fn take_offered(&self) -> Vec<Vec<bitcoin::OutPoint>> {
+			core::mem::take(&mut *self.offered.lock().unwrap())
+		}
+	}
+
+	impl OutputSpender for LeaveOneOutSpender {
+		fn spend_spendable_outputs(
+			&self, descriptors: &[&SpendableOutputDescriptor], _: Vec<TxOut>,
+			change_destination_script: ScriptBuf, _: u32, locktime: Option<LockTime>,
+			_: &Secp256k1<All>,
+		) -> Result<Transaction, ()> {
+			let mut offered: Vec<bitcoin::OutPoint> = descriptors
+				.iter()
+				.map(|descriptor| descriptor.spendable_outpoint().into_bitcoin_outpoint())
+				.collect();
+			offered.sort();
+			self.offered.lock().unwrap().push(offered.clone());
+
+			// `TxIn::default()` has the sequence `Sequence::MAX`. `TestBroadcaster` needs it for a
+			// transaction with a locktime in the future.
+			let input: Vec<bitcoin::TxIn> = offered
+				.into_iter()
+				.filter(|outpoint| *outpoint != self.left_out)
+				.map(|previous_output| bitcoin::TxIn { previous_output, ..Default::default() })
+				.collect();
+			if input.is_empty() {
+				return Err(());
+			}
+			let value = Amount::from_sat(1_000);
+			let output = TxOut { value, script_pubkey: change_destination_script };
+			Ok(Transaction {
+				version: Version::TWO,
+				lock_time: locktime.unwrap_or(LockTime::ZERO),
+				input,
+				output: vec![output],
+			})
+		}
+	}
+
+	type TestSweeper<'a> = OutputSweeper<
+		&'a TestBroadcaster,
+		Box<DummyChangeDestSource>,
+		&'a DummyFeeEstimator,
+		&'a DummyFilter,
+		KVStoreSyncWrapper<&'a TestStore>,
+		&'a DummyLogger,
+		&'a LeaveOneOutSpender,
+	>;
+
+	fn new_sweeper<'a>(
+		best_block: BestBlock, broadcaster: &'a TestBroadcaster, spender: &'a LeaveOneOutSpender,
+		store: &'a TestStore,
+	) -> TestSweeper<'a> {
+		OutputSweeper::new(
+			best_block,
+			broadcaster,
+			&DummyFeeEstimator,
+			None,
+			spender,
+			Box::new(DummyChangeDestSource),
+			KVStoreSyncWrapper(store),
+			&DummyLogger,
+		)
+	}
+
+	/// Makes a sweeper from the bytes that a sweeper wrote, as `lightning-node` does at start-up.
+	fn restart<'a>(
+		persisted: &[u8], broadcaster: &'a TestBroadcaster, spender: &'a LeaveOneOutSpender,
+		store: &'a TestStore,
+	) -> (BestBlock, TestSweeper<'a>) {
+		let args = (
+			broadcaster,
+			&DummyFeeEstimator,
+			None,
+			spender,
+			Box::new(DummyChangeDestSource),
+			KVStoreSyncWrapper(store),
+			&DummyLogger,
+		);
+		let mut reader = io::Cursor::new(persisted);
+		<(BestBlock, TestSweeper<'a>) as ReadableArgs<_>>::read(&mut reader, args).unwrap()
+	}
+
+	/// A chain of blocks with no transactions, except for the ones that a test gives.
+	struct TestChain {
+		tip: BestBlock,
+		// After a reorg, the new blocks differ from the old blocks of the same height.
+		fork: u32,
+	}
+
+	impl TestChain {
+		fn new(tip: BestBlock) -> Self {
+			Self { tip, fork: 0 }
+		}
+
+		fn connect(&mut self, sweeper: &TestSweeper<'_>, txs: &[&Transaction]) {
+			let height = self.tip.height + 1;
+			let header = Header {
+				version: bitcoin::block::Version::NO_SOFT_FORK_SIGNALLING,
+				prev_blockhash: self.tip.block_hash,
+				merkle_root: bitcoin::hash_types::TxMerkleNode::all_zeros(),
+				time: self.fork,
+				bits: bitcoin::pow::CompactTarget::from_consensus(42),
+				nonce: height,
+			};
+			let txdata: Vec<(usize, &Transaction)> =
+				txs.iter().enumerate().map(|(index, tx)| (index, *tx)).collect();
+			sweeper.filtered_block_connected(&header, &txdata, height);
+			self.tip = BestBlock::new(header.block_hash(), height);
+		}
+
+		fn connect_empty(&mut self, sweeper: &TestSweeper<'_>, count: u32) {
+			for _ in 0..count {
+				self.connect(sweeper, &[]);
+			}
+		}
+
+		fn reorg(&mut self, sweeper: &TestSweeper<'_>, fork_point: BestBlock) {
+			sweeper.blocks_disconnected(fork_point);
+			self.tip = fork_point;
+			self.fork += 1;
+		}
+	}
+
+	/// Returns the outpoint with a txid of 32 bytes of `id` and the index 0.
+	fn outpoint_of(id: u8) -> OutPoint {
+		OutPoint { txid: Txid::from_byte_array([id; 32]), index: 0 }
+	}
+
+	fn static_output(id: u8) -> SpendableOutputDescriptor {
+		SpendableOutputDescriptor::StaticOutput {
+			outpoint: outpoint_of(id),
+			output: TxOut { value: Amount::from_sat(100_000), script_pubkey: ScriptBuf::new() },
+			channel_keys_id: None,
+		}
+	}
+
+	/// Returns the status of the tracked output of `outpoint_of(id)`, or `None` if the sweeper does
+	/// not track it.
+	fn status_of(sweeper: &TestSweeper<'_>, id: u8) -> Option<OutputSpendStatus> {
+		let outpoint = outpoint_of(id).into_bitcoin_outpoint();
+		let is_output = |o: &TrackedSpendableOutput| {
+			o.descriptor.spendable_outpoint().into_bitcoin_outpoint() == outpoint
+		};
+		sweeper.tracked_spendable_outputs().into_iter().find(is_output).map(|o| o.status)
+	}
+
+	fn sorted(mut outpoints: Vec<bitcoin::OutPoint>) -> Vec<bitcoin::OutPoint> {
+		outpoints.sort();
+		outpoints
+	}
+
+	fn spent_outpoints(tx: &Transaction) -> Vec<bitcoin::OutPoint> {
+		tx.input.iter().map(|input| input.previous_output).collect()
+	}
+
+	fn persisted_state(store: &TestStore) -> Vec<u8> {
+		KVStoreSync::read(
+			store,
+			OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
+			OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+			OUTPUT_SWEEPER_PERSISTENCE_KEY,
+		)
+		.unwrap()
+	}
+
+	/// Polls a future one time. The futures in these tests are ready at once, as the store and the
+	/// change address source do not wait.
+	fn poll_ready<T>(fut: impl Future<Output = T>) -> T {
+		let mut fut = Box::pin(fut);
+		let waker = dummy_waker();
+		let mut ctx = task::Context::from_waker(&waker);
+		match fut.as_mut().poll(&mut ctx) {
+			Poll::Ready(result) => result,
+			Poll::Pending => panic!("The future is not ready"),
+		}
+	}
+
+	// The two tests below with the prefix `close_script_contract_` pin the sweeper behavior that
+	// `lightning-node` needs for a descriptor that its spender leaves out. Run them before each
+	// change of the fork revision in `lightning-node`.
+
+	#[test]
+	fn close_script_contract_sweeper_offers_left_out_descriptor_again() {
+		const KEPT: u8 = 1;
+		const LEFT_OUT: u8 = 2;
+		const LATER: u8 = 3;
+		let kept = outpoint_of(KEPT).into_bitcoin_outpoint();
+		let left_out = outpoint_of(LEFT_OUT).into_bitcoin_outpoint();
+		let later = outpoint_of(LATER).into_bitcoin_outpoint();
+
+		let start = BestBlock::new(BlockHash::all_zeros(), 100);
+		let store = TestStore::new(false);
+		let broadcaster = TestBroadcaster::new(Network::Regtest);
+		let spender = LeaveOneOutSpender::new(outpoint_of(LEFT_OUT));
+		let sweeper = new_sweeper(start, &broadcaster, &spender, &store);
+		let mut chain = TestChain::new(start);
+
+		// The sweeper writes its state when it starts to track the outputs. This is the state
+		// before the leave-out.
+		let tracked = vec![static_output(KEPT), static_output(LEFT_OUT)];
+		poll_ready(sweeper.track_spendable_outputs(tracked, None, false, None)).unwrap();
+		let persisted_before_leave_out = persisted_state(&store);
+
+		// The first sweep: the spender leaves one output out of the transaction. The sweeper marks
+		// both outputs as broadcast, as it marks each output that it gave to the spender.
+		poll_ready(sweeper.regenerate_and_broadcast_spend_if_necessary()).unwrap();
+		assert_eq!(spender.take_offered(), vec![sorted(vec![kept, left_out])]);
+		let sweeps = broadcaster.txn_broadcast();
+		assert_eq!(sweeps.len(), 1);
+		assert_eq!(spent_outpoints(&sweeps[0]), vec![kept]);
+		assert!(matches!(
+			status_of(&sweeper, LEFT_OUT),
+			Some(OutputSpendStatus::PendingFirstConfirmation { latest_broadcast_height: 100, .. })
+		));
+		// The sweeper gives each output one time for each block height.
+		poll_ready(sweeper.regenerate_and_broadcast_spend_if_necessary()).unwrap();
+		assert!(spender.take_offered().is_empty());
+
+		// The next block confirms the sweep transaction. It does not confirm the output that the
+		// spender left out.
+		chain.connect(&sweeper, &[&sweeps[0]]);
+		assert!(matches!(
+			status_of(&sweeper, KEPT),
+			Some(OutputSpendStatus::PendingThresholdConfirmations { confirmation_height: 101, .. })
+		));
+		assert!(matches!(
+			status_of(&sweeper, LEFT_OUT),
+			Some(OutputSpendStatus::PendingFirstConfirmation { latest_broadcast_height: 100, .. })
+		));
+		// The sweeper gives the output again. It is the only output due, so the spender gives
+		// `Err`, and the sweeper changes nothing. It gives the output again at each try.
+		for _ in 0..2 {
+			assert!(poll_ready(sweeper.regenerate_and_broadcast_spend_if_necessary()).is_err());
+			assert_eq!(spender.take_offered(), vec![vec![left_out]]);
+		}
+
+		// After `PRUNE_DELAY_BLOCKS`, the sweeper has removed the confirmed output, so it does
+		// remove outputs. It has not removed the output that the spender left out.
+		chain.connect_empty(&sweeper, PRUNE_DELAY_BLOCKS);
+		assert_eq!(status_of(&sweeper, KEPT), None);
+		assert!(matches!(
+			status_of(&sweeper, LEFT_OUT),
+			Some(OutputSpendStatus::PendingFirstConfirmation { latest_broadcast_height: 100, .. })
+		));
+		assert!(poll_ready(sweeper.regenerate_and_broadcast_spend_if_necessary()).is_err());
+		assert_eq!(spender.take_offered(), vec![vec![left_out]]);
+
+		// A new output makes the sweeper write its state. This is the state after the leave-out.
+		let tracked = vec![static_output(LATER)];
+		poll_ready(sweeper.track_spendable_outputs(tracked, None, false, None)).unwrap();
+		let persisted_after_leave_out = persisted_state(&store);
+
+		// A restart from the state after the leave-out: the sweeper gives the output again.
+		let restored_broadcaster = TestBroadcaster::new(Network::Regtest);
+		let restored_spender = LeaveOneOutSpender::new(outpoint_of(LEFT_OUT));
+		let (restored_block, restored) =
+			restart(&persisted_after_leave_out, &restored_broadcaster, &restored_spender, &store);
+		assert_eq!(restored_block.block_hash, chain.tip.block_hash);
+		assert_eq!(restored_block.height, chain.tip.height);
+		poll_ready(restored.regenerate_and_broadcast_spend_if_necessary()).unwrap();
+		assert_eq!(restored_spender.take_offered(), vec![sorted(vec![left_out, later])]);
+		let restored_sweeps = restored_broadcaster.txn_broadcast();
+		assert_eq!(restored_sweeps.len(), 1);
+		assert_eq!(spent_outpoints(&restored_sweeps[0]), vec![later]);
+
+		// A restart from the state before the leave-out: the sweeper gives both outputs.
+		let early_broadcaster = TestBroadcaster::new(Network::Regtest);
+		let early_spender = LeaveOneOutSpender::new(outpoint_of(LEFT_OUT));
+		let (early_block, early) =
+			restart(&persisted_before_leave_out, &early_broadcaster, &early_spender, &store);
+		assert_eq!(early_block.block_hash, start.block_hash);
+		assert_eq!(early_block.height, start.height);
+		poll_ready(early.regenerate_and_broadcast_spend_if_necessary()).unwrap();
+		assert_eq!(early_spender.take_offered(), vec![sorted(vec![kept, left_out])]);
+	}
+
+	#[test]
+	fn close_script_contract_sweeper_keeps_left_out_descriptor_through_reorg() {
+		const KEPT: u8 = 1;
+		const LEFT_OUT: u8 = 2;
+
+		let start = BestBlock::new(BlockHash::all_zeros(), 100);
+		let store = TestStore::new(false);
+		let broadcaster = TestBroadcaster::new(Network::Regtest);
+		let spender = LeaveOneOutSpender::new(outpoint_of(LEFT_OUT));
+		let sweeper = new_sweeper(start, &broadcaster, &spender, &store);
+		let mut chain = TestChain::new(start);
+
+		// The first sweep leaves one output out, and marks it as broadcast.
+		let tracked = vec![static_output(KEPT), static_output(LEFT_OUT)];
+		poll_ready(sweeper.track_spendable_outputs(tracked, None, false, None)).unwrap();
+		poll_ready(sweeper.regenerate_and_broadcast_spend_if_necessary()).unwrap();
+
+		// Another wallet, not the sweeper, spends the output that the spender left out. A block
+		// confirms that spend.
+		let foreign_spend = Transaction {
+			version: Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: vec![bitcoin::TxIn {
+				previous_output: outpoint_of(LEFT_OUT).into_bitcoin_outpoint(),
+				..Default::default()
+			}],
+			output: Vec::new(),
+		};
+		let fork_point = chain.tip;
+		chain.connect(&sweeper, &[&foreign_spend]);
+		assert!(matches!(
+			status_of(&sweeper, LEFT_OUT),
+			Some(OutputSpendStatus::PendingThresholdConfirmations { confirmation_height: 101, .. })
+		));
+
+		// A reorg removes that block. The spend is not confirmed any more.
+		chain.reorg(&sweeper, fork_point);
+		assert!(matches!(
+			status_of(&sweeper, LEFT_OUT),
+			Some(OutputSpendStatus::PendingFirstConfirmation { .. })
+		));
+
+		// An output with no confirmed spend stays after `PRUNE_DELAY_BLOCKS` blocks.
+		chain.connect_empty(&sweeper, PRUNE_DELAY_BLOCKS);
+		assert!(status_of(&sweeper, LEFT_OUT).is_some());
+		assert!(status_of(&sweeper, KEPT).is_some());
+
+		// A block confirms the spend again. The sweeper removes the output when the block of the
+		// spend and `PRUNE_DELAY_BLOCKS - 1` blocks after it are on the chain.
+		chain.connect(&sweeper, &[&foreign_spend]);
+		chain.connect_empty(&sweeper, PRUNE_DELAY_BLOCKS - 2);
+		assert!(status_of(&sweeper, LEFT_OUT).is_some());
+		chain.connect_empty(&sweeper, 1);
+		assert_eq!(status_of(&sweeper, LEFT_OUT), None);
+		assert!(status_of(&sweeper, KEPT).is_some());
 	}
 }

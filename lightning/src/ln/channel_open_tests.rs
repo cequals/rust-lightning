@@ -2640,17 +2640,12 @@ fn test_fund_pending_channel() {
 // of the fork revision in `lightning-node`: `cargo test -p lightning --lib close_script_contract_`.
 // The recorder keeps the thread and the kind of each call, not its arguments.
 
-/// Returns the kind of each call in `calls`, oldest first.
-fn signer_call_kinds(calls: &[SignerCall]) -> Vec<SignerCallKind> {
-	calls.iter().map(|call| call.kind).collect()
-}
-
 /// Checks the signer calls of one channel creation: `calls` are the calls that the node made in
 /// one `create_channel` call, in one `accept_inbound_channel` call, or in one `handle_open_channel`
 /// call that makes the channel. The test thread made that LDK call. Each call of `calls` ran on
 /// `thread`, and thus ran before the LDK call returned.
 fn check_creation_signer_calls(calls: &[SignerCall], thread: std::thread::ThreadId) {
-	let kinds = signer_call_kinds(calls);
+	let kinds: Vec<_> = calls.iter().map(|call| call.kind).collect();
 	// No keys-ID call and no script call comes twice. A second keys-ID call between the two script
 	// calls would give the shutdown call the wrong channel.
 	for kind in [

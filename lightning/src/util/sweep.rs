@@ -1128,6 +1128,7 @@ where
 mod tests {
 	use super::*;
 	use crate::chain::transaction::OutPoint;
+	use crate::ln::functional_test_utils::create_dummy_header;
 	use crate::sign::{ChangeDestinationSource, OutputSpender};
 	use crate::util::async_poll::dummy_waker;
 	use crate::util::logger::Record;
@@ -1436,14 +1437,7 @@ mod tests {
 
 		fn connect(&mut self, sweeper: &TestSweeper<'_>, txs: &[&Transaction]) {
 			let height = self.tip.height + 1;
-			let header = Header {
-				version: bitcoin::block::Version::NO_SOFT_FORK_SIGNALLING,
-				prev_blockhash: self.tip.block_hash,
-				merkle_root: bitcoin::hash_types::TxMerkleNode::all_zeros(),
-				time: self.fork,
-				bits: bitcoin::pow::CompactTarget::from_consensus(42),
-				nonce: height,
-			};
+			let header = create_dummy_header(self.tip.block_hash, self.fork);
 			let txdata: Vec<(usize, &Transaction)> =
 				txs.iter().enumerate().map(|(index, tx)| (index, *tx)).collect();
 			sweeper.filtered_block_connected(&header, &txdata, height);
@@ -1484,11 +1478,6 @@ mod tests {
 			o.descriptor.spendable_outpoint().into_bitcoin_outpoint() == outpoint
 		};
 		sweeper.tracked_spendable_outputs().into_iter().find(is_output).map(|o| o.status)
-	}
-
-	fn sorted(mut outpoints: Vec<bitcoin::OutPoint>) -> Vec<bitcoin::OutPoint> {
-		outpoints.sort();
-		outpoints
 	}
 
 	fn spent_outpoints(tx: &Transaction) -> Vec<bitcoin::OutPoint> {
@@ -1546,7 +1535,7 @@ mod tests {
 		// The first sweep: the spender leaves one output out of the transaction. The sweeper marks
 		// both outputs as broadcast, as it marks each output that it gave to the spender.
 		poll_ready(sweeper.regenerate_and_broadcast_spend_if_necessary()).unwrap();
-		assert_eq!(spender.take_offered(), vec![sorted(vec![kept, left_out])]);
+		assert_eq!(spender.take_offered(), vec![vec![kept, left_out]]);
 		let sweeps = broadcaster.txn_broadcast();
 		assert_eq!(sweeps.len(), 1);
 		assert_eq!(spent_outpoints(&sweeps[0]), vec![kept]);
@@ -1600,7 +1589,7 @@ mod tests {
 		assert_eq!(restored_block.block_hash, chain.tip.block_hash);
 		assert_eq!(restored_block.height, chain.tip.height);
 		poll_ready(restored.regenerate_and_broadcast_spend_if_necessary()).unwrap();
-		assert_eq!(restored_spender.take_offered(), vec![sorted(vec![left_out, later])]);
+		assert_eq!(restored_spender.take_offered(), vec![vec![left_out, later]]);
 		let restored_sweeps = restored_broadcaster.txn_broadcast();
 		assert_eq!(restored_sweeps.len(), 1);
 		assert_eq!(spent_outpoints(&restored_sweeps[0]), vec![later]);
@@ -1613,7 +1602,7 @@ mod tests {
 		assert_eq!(early_block.block_hash, start.block_hash);
 		assert_eq!(early_block.height, start.height);
 		poll_ready(early.regenerate_and_broadcast_spend_if_necessary()).unwrap();
-		assert_eq!(early_spender.take_offered(), vec![sorted(vec![kept, left_out])]);
+		assert_eq!(early_spender.take_offered(), vec![vec![kept, left_out]]);
 	}
 
 	#[test]
